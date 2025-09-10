@@ -6,13 +6,13 @@ namespace duckdb {
 
 struct HTTPFunctions {
 public:
-	static void Register(DatabaseInstance &db) {
-		RegisterHTTPRequestFunction(db);
+	static void Register(ExtensionLoader &loader) {
+		RegisterHTTPRequestFunction(loader);
 	}
 
 private:
 	//! Register HTTPRequest functions
-	static void RegisterHTTPRequestFunction(DatabaseInstance &db);
+	static void RegisterHTTPRequestFunction(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

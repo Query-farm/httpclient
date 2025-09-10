@@ -4,7 +4,6 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
@@ -359,10 +358,10 @@ static void HTTPPostFormRequestFunction(DataChunk &args, ExpressionState &state,
 }
 
 
-static void LoadInternal(DatabaseInstance &instance) {
+static void LoadInternal(ExtensionLoader &loader) {
     ScalarFunctionSet http_head("http_head");
     http_head.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPHeadRequestFunction));
-    ExtensionUtil::RegisterFunction(instance, http_head);
+    loader.RegisterFunction(http_head);
 
     ScalarFunctionSet http_get("http_get");
     http_get.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPGetRequestFunction));
@@ -370,24 +369,24 @@ static void LoadInternal(DatabaseInstance &instance) {
         {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
         LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
         LogicalType::JSON(), HTTPGetExRequestFunction));
-    ExtensionUtil::RegisterFunction(instance, http_get);
+    loader.RegisterFunction(http_get);
 
     ScalarFunctionSet http_post("http_post");
     http_post.AddFunction(ScalarFunction(
         {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR), LogicalType::JSON()},
         LogicalType::JSON(), HTTPPostRequestFunction));
-    ExtensionUtil::RegisterFunction(instance, http_post);
+    loader.RegisterFunction(http_post);
 
     ScalarFunctionSet http_post_form("http_post_form");
     http_post_form.AddFunction(ScalarFunction(
         {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
             LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
         LogicalType::JSON(), HTTPPostFormRequestFunction));
-    ExtensionUtil::RegisterFunction(instance, http_post_form);
+    loader.RegisterFunction(http_post_form);
 }
 
-void HttpClientExtension::Load(DuckDB &db) {
-    LoadInternal(*db.instance);
+void HttpClientExtension::Load(ExtensionLoader &loader) {
+    LoadInternal(loader);
 }
 
 std::string HttpClientExtension::Name() {
@@ -406,16 +405,8 @@ std::string HttpClientExtension::Version() const {
 } // namespace duckdb
 
 extern "C" {
-DUCKDB_EXTENSION_API void http_client_init(duckdb::DatabaseInstance &db) {
-    duckdb::DuckDB db_wrapper(db);
-    db_wrapper.LoadExtension<duckdb::HttpClientExtension>();
-}
 
-DUCKDB_EXTENSION_API const char *http_client_version() {
-    return duckdb::DuckDB::LibraryVersion();
+DUCKDB_CPP_EXTENSION_ENTRY(http_client, loader) {
+	duckdb::LoadInternal(loader);
 }
 }
-
-#ifndef DUCKDB_EXTENSION_MAIN
-#error DUCKDB_EXTENSION_MAIN not defined
-#endif
