@@ -20,15 +20,16 @@ project(${TARGET_NAME})
 
 include_directories(src/include duckdb/third_party/httplib)
 
-set(EXTENSION_SOURCES src/http_client_extension.cpp)
+set(EXTENSION_SOURCES src/http_client_extension.cpp
+src/query_farm_telemetry.cpp)
 
 if(MINGW)
     set(OPENSSL_USE_STATIC_LIBS TRUE)
 endif()
 
 # Common libraries needed for both targets
-set(COMMON_LIBS 
-    duckdb_mbedtls 
+set(COMMON_LIBS
+    duckdb_mbedtls
     ${OPENSSL_LIBRARIES}
 )
 
