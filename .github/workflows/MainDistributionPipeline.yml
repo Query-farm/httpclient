@@ -1,27 +1,13 @@
-#
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
-#
 name: Main Extension Distribution Pipeline
 on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
+  push: null
+  pull_request: null
+  workflow_dispatch: null
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{
+    github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
   cancel-in-progress: true
-
 jobs:
-  # duckdb-next-build:
-  #   if: false
-  #   name: Build extension binaries
-  #   uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
-  #   with:
-  #     duckdb_version: v1.4-andium
-  #     ci_tools_version: main
-  #     extension_name: http_client
-  #     exclude_archs: 'windows_amd64_mingw'
-
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
@@ -29,4 +15,4 @@ jobs:
       duckdb_version: v1.4-andium
       ci_tools_version: main
       extension_name: http_client
-      exclude_archs: "windows_amd64_mingw"
+      exclude_archs: windows_amd64_mingw
