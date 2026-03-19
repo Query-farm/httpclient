@@ -18,33 +18,33 @@ query III
 WITH __input AS (
   SELECT
     http_get(
-        'https://httpbingo.org/delay/0'
+        'https://httpbin.org/get'
     ) AS res
 ),
 __response AS (
   SELECT
     (res->>'status')::INT AS status,
     (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR[]"}') ) AS features
+    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
   FROM
     __input
 )
 SELECT
   __response.status,
   __response.reason,
-  __response.Host[1] AS host
+  __response.Host AS host
 FROM
   __response
 ;
 ----
-200	OK	httpbingo.org
+200	OK	httpbin.org
 
 # Confirm the GET extension works with headers and params
 query III
 WITH __input AS (
   SELECT
     http_get(
-        'https://httpbingo.org/delay/0',
+        'https://httpbin.org/get',
         headers => MAP {
           'accept': 'application/json',
         },
@@ -57,26 +57,26 @@ __response AS (
   SELECT
     (res->>'status')::INT AS status,
     (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR[]"}') ) AS features
+    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
   FROM
     __input
 )
 SELECT
   __response.status,
   __response.reason,
-  __response.Host[1] AS host
+  __response.Host AS host
 FROM
   __response
 ;
 ----
-200	OK	httpbingo.org
+200	OK	httpbin.org
 
 # Confirm the POST extension works
 query III
 WITH __input AS (
   SELECT
     http_post(
-        'https://httpbingo.org/delay/0',
+        'https://httpbin.org/post',
         headers => MAP {
           'accept': 'application/json',
         },
@@ -88,19 +88,19 @@ __response AS (
   SELECT
     (res->>'status')::INT AS status,
     (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR[]"}') ) AS features
+    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
   FROM
     __input
 )
 SELECT
   __response.status,
   __response.reason,
-  __response.Host[1] AS host
+  __response.Host AS host
 FROM
   __response
 ;
 ----
-200	OK	httpbingo.org
+200	OK	httpbin.org
 
 # Confirm the POST extension works with headers and params
 query I
@@ -140,7 +140,7 @@ query III
 WITH __input AS (
   SELECT
     http_post_form(
-        'https://httpbingo.org/delay/0',
+        'https://httpbin.org/post',
         headers => MAP {
           'accept': 'application/json',
         },
@@ -153,26 +153,26 @@ __response AS (
   SELECT
     (res->>'status')::INT AS status,
     (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR[]"}') ) AS features
+    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
   FROM
     __input
 )
 SELECT
   __response.status,
   __response.reason,
-  __response.Host[1] AS host
+  __response.Host AS host
 FROM
   __response
 ;
 ----
-200	OK	httpbingo.org
+200	OK	httpbin.org
 
 # Confirm the POST function with form encoding transmits a single value
 query III
 WITH __input AS (
   SELECT
     http_post_form(
-        'https://httpbingo.org/delay/0',
+        'https://httpbin.org/post',
         headers => MAP {
           'accept': 'application/json',
         },
@@ -185,14 +185,14 @@ __response AS (
   SELECT
     (res->>'status')::INT AS status,
     (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'form', '{"limit": "VARCHAR[]"}') ) AS features
+    unnest( from_json(((res->>'body')::JSON)->'form', '{"limit": "VARCHAR"}') ) AS features
   FROM
     __input
 )
 SELECT
   __response.status,
   __response.reason,
-  __response.limit[1] AS limit
+  __response.limit AS limit
 FROM
   __response
 ;
