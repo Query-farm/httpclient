@@ -409,6 +409,51 @@ namespace duckdb
             });
     }
 
+    static void HTTPPostRawRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
+    {
+        D_ASSERT(args.data.size() == 4);
+    
+        using STRING_TYPE = PrimitiveType<string_t>;
+        using LENTRY_TYPE = PrimitiveType<list_entry_t>;
+    
+        auto &url_vector = args.data[0];
+        auto &headers_vector = args.data[1];
+        auto &headers_entry = ListVector::GetEntry(headers_vector);
+        auto &body_vector = args.data[2];
+        auto &ctype_vector = args.data[3];
+    
+        GenericExecutor::ExecuteQuaternary<STRING_TYPE, LENTRY_TYPE, STRING_TYPE, STRING_TYPE, STRING_TYPE>(
+            url_vector, headers_vector, body_vector, ctype_vector, result, args.size(),
+            [&](STRING_TYPE url, LENTRY_TYPE headers, STRING_TYPE body, STRING_TYPE content_type)
+            {
+                std::string url_str = url.val.GetString();
+    
+                // Use helper to setup client and parse URL
+                auto client_and_path = SetupHttpClient(url_str);
+                auto &client = client_and_path.first;
+                auto &path = client_and_path.second;
+    
+                // Prepare headers
+                duckdb_httplib_openssl::Headers header_map;
+                auto header_list = headers.val;
+                ConvertListEntryToMap<duckdb_httplib_openssl::Headers>(header_list, headers_entry, header_map);
+    
+                // Make the POST request with headers and the provided content type
+                auto res = client.Post(path.c_str(), header_map, body.val.GetString(), content_type.val.GetString());
+                if (res)
+                {
+                    std::string response = GetJsonResponse(res->status, res->reason, res->body);
+                    return StringVector::AddString(result, response);
+                }
+                else
+                {
+                    std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "POST"), "");
+                    return StringVector::AddString(result, response);
+                }
+            });
+    }
+
+
     static void LoadInternal(ExtensionLoader &loader)
     {
         ScalarFunctionSet http_head("http_head");
@@ -435,6 +480,13 @@ namespace duckdb
              LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
             LogicalType::JSON(), HTTPPostFormRequestFunction));
         loader.RegisterFunction(http_post_form);
+
+        ScalarFunctionSet http_post_raw("http_post_raw");
+        http_post_raw.AddFunction(ScalarFunction(
+            {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+             LogicalType::VARCHAR, LogicalType::VARCHAR},
+            LogicalType::JSON(), HTTPPostRawRequestFunction));
+        loader.RegisterFunction(http_post_raw);
 
         QueryFarmSendTelemetry(loader, "http_client", "2025100901");
     }
