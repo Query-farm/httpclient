@@ -1,0 +1,315 @@
+# name: test/sql/httpclient_features.test
+# description: VOLATILE, POST overloads, multipart, secrets, headers, blob, proxy, retries
+# group: [http_client]
+
+require http_client
+
+require json
+
+# HTTP functions must be VOLATILE so nested constant calls are not double-executed
+query I
+SELECT DISTINCT stability
+FROM duckdb_functions()
+WHERE function_name IN ('http_head', 'http_get', 'http_get_blob', 'http_post', 'http_post_form', 'http_post_multipart')
+ORDER BY 1
+;
+----
+VOLATILE
+
+# Nested extraction (the pattern that previously folded the call twice) still returns one row
+query I
+SELECT (http_post(
+    'https://httpbin.org/post',
+    headers => MAP {
+      'accept': 'application/json'
+    },
+    params => MAP {}
+)->>'status')::INT
+;
+----
+200
+
+# HEAD request
+query I
+SELECT (http_head('https://httpbin.org/get')->>'status')::INT
+;
+----
+200
+
+# Raw VARCHAR body (issue #27) — not JSON-encoded
+query II
+WITH __input AS (
+  SELECT http_post('https://httpbin.org/post', '2 2 +') AS res
+),
+__response AS (
+  SELECT
+    (res->>'status')::INT AS status,
+    ((res->>'body')::JSON)->>'data' AS data
+  FROM __input
+)
+SELECT status, data FROM __response
+;
+----
+200	2 2 +
+
+# Raw VARCHAR body with headers, including Content-Type override
+query II
+WITH __input AS (
+  SELECT http_post(
+      'https://httpbin.org/post',
+      headers => MAP {
+        'Content-Type': 'text/plain'
+      },
+      params => 'REV'
+  ) AS res
+),
+__response AS (
+  SELECT
+    (res->>'status')::INT AS status,
+    ((res->>'body')::JSON)->>'data' AS data
+  FROM __input
+)
+SELECT status, data FROM __response
+;
+----
+200	REV
+
+# MAP params still produce a JSON object of strings (issue #30)
+query I
+SELECT ((http_post(
+    'https://httpbin.org/post',
+    headers => MAP {
+      'accept': 'application/json'
+    },
+    params => MAP {
+      'limit': '10'
+    }
+)->>'body')::JSON)->'json'->>'limit'
+;
+----
+10
+
+# Nested JSON params (not MAP) keep arrays/objects (issue #30)
+query I
+SELECT ((http_post(
+    'https://httpbin.org/post',
+    headers => MAP {
+      'accept': 'application/json'
+    },
+    params => {
+      'limit': 10,
+      'tags': ['alpha', 'beta']
+    }
+)->>'body')::JSON)->'json'->'tags'->>0
+;
+----
+alpha
+
+# multipart/form-data with a form field and an in-memory file (issue #35)
+query III
+WITH __input AS (
+  SELECT http_post_multipart(
+      'https://httpbin.org/post',
+      headers => MAP {
+        'accept': 'application/json'
+      },
+      fields => MAP {
+        'foo': 'bar'
+      },
+      files => [
+        {
+          'name': 'data',
+          'content': 'hello,world'::BLOB,
+          'filename': 'hello.csv',
+          'content_type': 'text/csv'
+        }
+      ]
+  ) AS res
+),
+__body AS (
+  SELECT ((res->>'body')::JSON) AS body
+  FROM __input
+)
+SELECT
+  (SELECT (res->>'status')::INT FROM __input) AS status,
+  body->'form'->>'foo' AS foo,
+  body->'files'->>'data' AS uploaded
+FROM __body
+;
+----
+200	bar	hello,world
+
+# Bearer token from TYPE http secret (issue #32)
+statement ok
+CREATE OR REPLACE SECRET httpclient_bearer (
+    TYPE HTTP,
+    SCOPE 'https://httpbin.org/bearer',
+    BEARER_TOKEN 'secret-token-123'
+);
+
+query II
+WITH __input AS (
+  SELECT http_get('https://httpbin.org/bearer') AS res
+),
+__response AS (
+  SELECT
+    (res->>'status')::INT AS status,
+    ((res->>'body')::JSON)->>'token' AS token
+  FROM __input
+)
+SELECT status, token FROM __response
+;
+----
+200	secret-token-123
+
+# Extra headers from the same secret type
+statement ok
+DROP SECRET httpclient_bearer;
+
+statement ok
+CREATE OR REPLACE SECRET httpclient_headers (
+    TYPE HTTP,
+    SCOPE 'https://httpbin.org/headers',
+    EXTRA_HTTP_HEADERS MAP {
+      'X-Secret-Header': 'from-secret'
+    }
+);
+
+query I
+SELECT ((http_get('https://httpbin.org/headers')->>'body')::JSON)->'headers'->>'X-Secret-Header'
+;
+----
+from-secret
+
+# Call-site headers win over secret values
+query I
+SELECT ((http_get(
+    'https://httpbin.org/headers',
+    headers => MAP {
+      'X-Secret-Header': 'from-call'
+    },
+    params => MAP {}
+)->>'body')::JSON)->'headers'->>'X-Secret-Header'
+;
+----
+from-call
+
+statement ok
+DROP SECRET httpclient_headers;
+
+# Response headers as a JSON object (issue #15)
+query I
+SELECT lower(http_get('https://httpbin.org/get')->'headers'->>'content-type') LIKE 'application/json%'
+;
+----
+true
+
+query I
+SELECT http_get('https://httpbin.org/response-headers?Link=next-page')->'headers'->>'link'
+;
+----
+next-page
+
+query I
+SELECT (http_head('https://httpbin.org/get')->'headers'->>'content-type') IS NOT NULL
+;
+----
+true
+
+# Binary PNG via http_get_blob (issue #26)
+query II
+SELECT
+  r.status,
+  substring(hex(r.body), 1, 8) AS png_magic
+FROM (SELECT http_get_blob('https://httpbin.org/image/png') AS r)
+;
+----
+200	89504E47
+
+# Binary via JSON http_get: no unicode error, body is base64
+query II
+SELECT
+  (res->>'status')::INT AS status,
+  (res->>'body_base64')::BOOLEAN AS is_b64
+FROM (SELECT http_get(
+    'https://httpbin.org/image/png',
+    headers => MAP {'accept': 'image/png'},
+    params => MAP {}
+) AS res)
+;
+----
+200	true
+
+# Dead proxy via SET http_proxy (issue #10) — connection refused, then restore
+statement ok
+SET http_proxy = '127.0.0.1:1';
+
+query I
+SELECT (http_get('https://httpbin.org/get')->>'status')::INT
+;
+----
+-1
+
+statement ok
+RESET http_proxy;
+
+query I
+SELECT (http_get('https://httpbin.org/get')->>'status')::INT
+;
+----
+200
+
+# Dead proxy via TYPE HTTP secret (secret wins over settings)
+statement ok
+CREATE OR REPLACE SECRET httpclient_bad_proxy (
+    TYPE HTTP,
+    SCOPE 'https://httpbin.org/uuid',
+    HTTP_PROXY '127.0.0.1:1'
+);
+
+query I
+SELECT (http_get('https://httpbin.org/uuid')->>'status')::INT
+;
+----
+-1
+
+statement ok
+DROP SECRET httpclient_bad_proxy;
+
+query I
+SELECT (http_get('https://httpbin.org/uuid')->>'status')::INT
+;
+----
+200
+
+# Retry settings (issue #16) — default 0, 401 is never retried
+query I
+SELECT current_setting('http_client_retries')
+;
+----
+0
+
+statement ok
+SET http_client_retries = 1;
+
+statement ok
+SET http_client_retry_wait_ms = 1;
+
+query I
+SELECT (http_get('https://httpbin.org/status/401')->>'status')::INT
+;
+----
+401
+
+query I
+SELECT (http_get('https://httpbin.org/status/500')->>'status')::INT
+;
+----
+500
+
+statement ok
+RESET http_client_retries;
+
+statement ok
+RESET http_client_retry_wait_ms;
+

@@ -12,11 +12,37 @@ LOAD http_client;
 ```
 
 ### Functions
-- `http_get(url)`
+- `http_head(url)`
+- `http_get(url)` / `http_get(url, headers, params)`
+  - JSON object with `status`, `reason`, `body`, and `headers` (response headers as a JSON object, keys lowercased). Non-UTF-8 bodies are base64-encoded and marked with `"body_base64": true`
+- `http_get_blob(url)` / `http_get_blob(url, headers, params)`
+  - Typed struct `{status INTEGER, reason VARCHAR, headers MAP(VARCHAR, VARCHAR), body BLOB}` for binary responses (images, protobuf, …)
 - `http_post(url, headers, params)`
-  - Sends POST request with params encoded as a JSON object
+  - JSON body (`Content-Type: application/json`). `params` may be a **JSON** value (objects, arrays, nested fields) or a **MAP** of strings (JSON-encoded as an object of string values). MAP is the legacy form used in older examples; JSON is required for nested payloads
+- `http_post(url, body)` / `http_post(url, headers, body)`
+  - Sends POST with a raw `VARCHAR` body (plain text, WarpScript, XML, …). Defaults to `text/plain`; set a `Content-Type` header to override
 - `http_post_form(url, headers, params)`
-  - Sends POST request with params being `application/x-www-form-urlencoded` encoded (used by many forms and some APIs)
+  - Sends POST with `application/x-www-form-urlencoded` encoding
+- `http_post_multipart(url, headers, fields, files)`
+  - Sends `multipart/form-data` with form fields and in-memory file parts (`BLOB` content, optional filename and content type)
+
+All request functions are **VOLATILE** so a nested call such as `http_post(...)->>'access_token'` is executed once.
+
+Response headers are optional to consume: they are always attached (`res->'headers'->>'link'` or `http_get_blob(url).headers['link']`) and can be ignored.
+
+Authentication uses DuckDB secrets of `TYPE http` (same as httpfs). A matching secret is applied by URL `SCOPE`: `BEARER_TOKEN` becomes an `Authorization` header, and `EXTRA_HTTP_HEADERS` are merged in. Explicit headers on the call win over secret values.
+
+HTTP proxies follow DuckDB’s `http_proxy` / `http_proxy_username` / `http_proxy_password` settings (and the `HTTP_PROXY` environment variable). A `TYPE http` secret may also set `HTTP_PROXY` (plus username/password); the secret wins over session settings.
+
+Retries are off by default. Optional session settings:
+
+```sql
+SET http_client_retries = 3;            -- extra attempts (default 0)
+SET http_client_retry_wait_ms = 100;    -- base wait before the first retry
+SET http_client_retry_backoff = 4.0;    -- exponential multiplier
+```
+
+Transport failures are always retried. HTTP 408, 429, 502, 503, and 504 are retried for every method; 500 is retried for GET/HEAD only. 401 and 403 are never retried. A `Retry-After` header on 429 is honored when it is a delay in seconds.
 
 ### Examples
 #### GET
@@ -49,6 +75,55 @@ D WITH __input AS (
 │    200 │ OK      │ httpbin.org │
 └────────┴─────────┴─────────────┘
 ```
+
+#### Response headers
+Paging APIs such as GitHub expose a `Link` header. Headers are a JSON object on the existing response (keys are lowercased):
+
+```sql
+SELECT http_get('https://httpbin.org/get')->'headers'->>'content-type';
+
+SELECT http_get('https://api.github.com/repos/duckdb/duckdb/issues?per_page=1')
+       ->'headers'->>'link';
+```
+
+#### Binary body (images, files)
+`http_get` cannot store invalid UTF-8 in JSON; binary payloads are base64-encoded there. Prefer `http_get_blob` for raw bytes:
+
+```sql
+SELECT
+  r.status,
+  r.headers['content-type'] AS content_type,
+  r.body
+FROM (SELECT http_get_blob('https://httpbin.org/image/png') AS r);
+```
+
+#### POST params: MAP vs JSON vs VARCHAR
+
+`http_post` has three body forms. They are distinct overloads, not implicit casts of each other:
+
+```sql
+-- MAP of strings → JSON object {"limit":"10"}  (legacy examples)
+SELECT http_post(
+    'https://httpbin.org/post',
+    headers => MAP { 'accept': 'application/json' },
+    params => MAP { 'limit': '10' }
+);
+
+-- JSON value → nested objects/arrays as-is
+SELECT http_post(
+    'https://httpbin.org/post',
+    headers => MAP { 'accept': 'application/json' },
+    params => {
+      'collections': ['sentinel-s2-l2a-cogs'],
+      'limit': 10
+    }
+);
+
+-- VARCHAR → raw body (not JSON-encoded)
+SELECT http_post('https://httpbin.org/post', '2 2 +');
+```
+
+Form-urlencoded bodies stay on `http_post_form`; file uploads stay on `http_post_multipart`.
 
 #### POST
 ```sql
@@ -123,6 +198,82 @@ FROM
 └────────┴─────────┴─────────┘
 ```
 
+#### POST a raw text body
+Use this when the API expects plain text rather than a JSON object (for example [Warp 10 WarpScript](https://github.com/Query-farm/httpclient/issues/27)).
+
+```sql
+SELECT http_post(
+    'https://httpbin.org/post',
+    '2 2 +'
+)->>'status';
+
+SELECT http_post(
+    'https://sandbox.senx.io/api/v0/exec',
+    headers => MAP {
+      'Content-Type': 'text/plain'
+    },
+    params => 'REV'
+);
+```
+
+#### POST multipart form data (fields + in-memory files)
+
+```sql
+SELECT http_post_multipart(
+    'https://httpbin.org/post',
+    headers => MAP {
+      'accept': 'application/json'
+    },
+    fields => MAP {
+      'foo': 'bar'
+    },
+    files => [
+      {
+        'name': 'data',
+        'content': 'col1,col2\n1,2'::BLOB,
+        'filename': 'input.csv',
+        'content_type': 'text/csv'
+      }
+    ]
+) AS res;
+```
+
+#### Proxies
+
+```sql
+SET http_proxy = 'localhost:8080';
+SET http_proxy_username = 'user';
+SET http_proxy_password = 'pass';
+
+CREATE SECRET via_proxy (
+    TYPE HTTP,
+    SCOPE 'https://httpbin.org',
+    HTTP_PROXY 'localhost:8080',
+    HTTP_PROXY_USERNAME 'user',
+    HTTP_PROXY_PASSWORD 'pass'
+);
+```
+
+#### Authenticate with a DuckDB secret
+
+```sql
+CREATE SECRET api_auth (
+    TYPE HTTP,
+    SCOPE 'https://httpbin.org',
+    BEARER_TOKEN 'my-token'
+);
+
+-- Authorization: Bearer my-token is attached automatically
+SELECT http_get('https://httpbin.org/bearer');
+
+CREATE OR REPLACE SECRET api_auth (
+    TYPE HTTP,
+    SCOPE 'https://httpbin.org',
+    EXTRA_HTTP_HEADERS MAP {
+      'X-Api-Key': 'super-secret'
+    }
+);
+```
 
 #### Full Example w/ spatial data
 This is the original example by @ahuarte47 inspiring this community extension.
