@@ -313,3 +313,27 @@ RESET http_client_retries;
 statement ok
 RESET http_client_retry_wait_ms;
 
+# Concurrency cap (issue #11) — default unlimited; max_parallel=1 still completes row-wise calls
+query I
+SELECT current_setting('http_client_max_parallel')
+;
+----
+0
+
+statement ok
+SET http_client_max_parallel = 1;
+
+query I
+SELECT COUNT(*)
+FROM (
+  SELECT http_get('https://httpbin.org/status/200') AS r
+  FROM range(2)
+)
+WHERE (r->>'status')::INT = 200
+;
+----
+2
+
+statement ok
+RESET http_client_max_parallel;
+

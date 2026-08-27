@@ -30,6 +30,8 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <mutex>
+#include <condition_variable>
 
 namespace duckdb
 {
@@ -209,6 +211,63 @@ namespace duckdb
         return fallback;
     }
 
+    struct ParallelGate
+    {
+        std::mutex mu;
+        std::condition_variable cv;
+        uint64_t in_flight = 0;
+    };
+
+    static ParallelGate &GetParallelGate()
+    {
+        static ParallelGate gate;
+        return gate;
+    }
+
+    // Caps in-flight HTTP calls across DuckDB worker threads. 0 = unlimited (default).
+    struct ParallelSlot
+    {
+        ParallelSlot() = delete;
+        explicit ParallelSlot(ExpressionState &state)
+        {
+            uint64_t max_parallel = 0;
+            if (state.HasContext())
+            {
+                max_parallel = SettingUBigint(state.GetContext(), "http_client_max_parallel", 0);
+            }
+            if (max_parallel == 0)
+            {
+                return;
+            }
+            auto &gate = GetParallelGate();
+            mu = &gate.mu;
+            cv = &gate.cv;
+            in_flight = &gate.in_flight;
+            std::unique_lock<std::mutex> lock(*mu);
+            cv->wait(lock, [&]() { return *in_flight < max_parallel; });
+            (*in_flight)++;
+            held = true;
+        }
+        ~ParallelSlot()
+        {
+            if (!held)
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(*mu);
+            (*in_flight)--;
+            cv->notify_all();
+        }
+        ParallelSlot(const ParallelSlot &) = delete;
+        ParallelSlot &operator=(const ParallelSlot &) = delete;
+
+    private:
+        std::mutex *mu = nullptr;
+        std::condition_variable *cv = nullptr;
+        uint64_t *in_flight = nullptr;
+        bool held = false;
+    };
+
     static RetryConfig GetRetryConfig(ExpressionState &state)
     {
         RetryConfig cfg;
@@ -281,6 +340,7 @@ namespace duckdb
     template <class FN>
     static duckdb_httplib_openssl::Result ExecuteWithRetry(ExpressionState &state, const std::string &method, FN &&fn)
     {
+        ParallelSlot slot(state);
         auto cfg = GetRetryConfig(state);
         duckdb_httplib_openssl::Result res;
         for (uint64_t attempt = 0; attempt <= cfg.retries; attempt++)
@@ -1141,6 +1201,13 @@ namespace duckdb
             config.AddExtensionOption("http_client_retry_backoff",
                                       "Exponential backoff multiplier applied after each HTTP client retry.",
                                       LogicalType::DOUBLE, Value(4.0));
+        }
+        if (!config.HasExtensionOption("http_client_max_parallel"))
+        {
+            config.AddExtensionOption(
+                "http_client_max_parallel",
+                "Maximum in-flight HTTP client requests across DuckDB threads. 0 means unlimited (default).",
+                LogicalType::UBIGINT, Value::UBIGINT(0));
         }
 
         QueryFarmSendTelemetry(loader, "http_client", "2026082701");

@@ -44,6 +44,24 @@ SET http_client_retry_backoff = 4.0;    -- exponential multiplier
 
 Transport failures are always retried. HTTP 408, 429, 502, 503, and 504 are retried for every method; 500 is retried for GET/HEAD only. 401 and 403 are never retried. A `Retry-After` header on 429 is honored when it is a delay in seconds.
 
+### Concurrency
+
+HTTP functions are ordinary DuckDB scalars. A query over millions of rows does **not** fire millions of requests at once.
+
+- Each DuckDB worker sends requests **one row after another** inside its current vector (up to 2048 rows).
+- Several workers may run at once (`SET threads = N`), so the number of in-flight HTTP calls is about **N**, not the table size.
+- There is no extra queue or rate limiter beyond DuckDB’s pipeline.
+
+To cap in-flight calls (for example to avoid bursting an API):
+
+```sql
+SET http_client_max_parallel = 4;   -- 0 = unlimited (default)
+-- optional: also lower DuckDB parallelism
+SET threads = 4;
+```
+
+`http_client_max_parallel = 1` serializes HTTP across all workers. Combined with `http_client_retries`, a retry holds its slot so other rows wait instead of stampeding the same endpoint.
+
 ### Examples
 #### GET
 ```sql
