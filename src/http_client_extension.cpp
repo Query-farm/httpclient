@@ -409,31 +409,51 @@ namespace duckdb
             });
     }
 
+    // Every function here performs a network request — a side effect. Such
+    // functions MUST be VOLATILE, otherwise DuckDB's optimizer treats them as
+    // pure and may evaluate a call with all-constant arguments at plan time
+    // (constant folding) in addition to execution time. Concretely, nesting a
+    // call inside a larger constant expression — the common idiom
+    //   SELECT http_post('http://…', …)->>'access_token'
+    // — sends the request TWICE on one query. The query result is still a
+    // single correct row, so the duplicate is only visible in the server's
+    // logs; for non-idempotent endpoints (OAuth code exchange, webhooks,
+    // POSTs that create rows) it is a correctness bug. Marking the functions
+    // volatile (same class as random()/nextval()) pins one request per
+    // logical call. Verified: nested constant-arg http_post sends 2 without
+    // volatile, exactly 1 with it; column/bind arguments already sent once
+    // and are unaffected.
+    static ScalarFunction MakeVolatile(ScalarFunction fn)
+    {
+        fn.SetVolatile();
+        return fn;
+    }
+
     static void LoadInternal(ExtensionLoader &loader)
     {
         ScalarFunctionSet http_head("http_head");
-        http_head.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPHeadRequestFunction));
+        http_head.AddFunction(MakeVolatile(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPHeadRequestFunction)));
         loader.RegisterFunction(http_head);
 
         ScalarFunctionSet http_get("http_get");
-        http_get.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPGetRequestFunction));
-        http_get.AddFunction(ScalarFunction(
+        http_get.AddFunction(MakeVolatile(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPGetRequestFunction)));
+        http_get.AddFunction(MakeVolatile(ScalarFunction(
             {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
              LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
-            LogicalType::JSON(), HTTPGetExRequestFunction));
+            LogicalType::JSON(), HTTPGetExRequestFunction)));
         loader.RegisterFunction(http_get);
 
         ScalarFunctionSet http_post("http_post");
-        http_post.AddFunction(ScalarFunction(
+        http_post.AddFunction(MakeVolatile(ScalarFunction(
             {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR), LogicalType::JSON()},
-            LogicalType::JSON(), HTTPPostRequestFunction));
+            LogicalType::JSON(), HTTPPostRequestFunction)));
         loader.RegisterFunction(http_post);
 
         ScalarFunctionSet http_post_form("http_post_form");
-        http_post_form.AddFunction(ScalarFunction(
+        http_post_form.AddFunction(MakeVolatile(ScalarFunction(
             {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
              LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
-            LogicalType::JSON(), HTTPPostFormRequestFunction));
+            LogicalType::JSON(), HTTPPostFormRequestFunction)));
         loader.RegisterFunction(http_post_form);
 
         QueryFarmSendTelemetry(loader, "http_client", "2026072501");
