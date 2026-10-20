@@ -3,6 +3,9 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
@@ -172,17 +175,13 @@ namespace duckdb
     {
         for (idx_t i = list_entry.offset; i < list_entry.offset + list_entry.length; i++)
         {
-            const auto &child_value = input.GetValue(i);
-
-            Vector tmp(child_value);
-            auto &children = StructVector::GetEntries(tmp);
+            const auto child_value = input.GetValue(i);
+            auto &children = StructValue::GetChildren(child_value);
 
             if (children.size() == 2)
             {
-                auto name = FlatVector::GetData<string_t>(*children[0]);
-                auto data = FlatVector::GetData<string_t>(*children[1]);
-                std::string key = name->GetString();
-                std::string val = data->GetString();
+                std::string key = children[0].IsNull() ? std::string() : children[0].ToString();
+                std::string val = children[1].IsNull() ? std::string() : children[1].ToString();
                 result.emplace(key, val);
             }
         }
@@ -219,7 +218,7 @@ namespace duckdb
     {
         D_ASSERT(args.data.size() == 1);
 
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t input)
+        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, [&](string_t input)
                                                    {
         std::string url = input.GetString();
 
@@ -252,7 +251,7 @@ namespace duckdb
     {
         D_ASSERT(args.data.size() == 1);
 
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t input)
+        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, [&](string_t input)
                                                    {
         std::string url = input.GetString();
 
@@ -281,12 +280,12 @@ namespace duckdb
 
         auto &url_vector = args.data[0];
         auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetEntry(headers_vector);
+        auto &headers_entry = ListVector::GetChild(headers_vector);
         auto &params_vector = args.data[2];
-        auto &params_entry = ListVector::GetEntry(params_vector);
+        auto &params_entry = ListVector::GetChild(params_vector);
 
         GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, LENTRY_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, params_vector, result, args.size(),
+            url_vector, headers_vector, params_vector, result,
             [&](STRING_TYPE url, LENTRY_TYPE headers, LENTRY_TYPE params)
             {
                 std::string url_str = url.val.GetString();
@@ -330,11 +329,11 @@ namespace duckdb
 
         auto &url_vector = args.data[0];
         auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetEntry(headers_vector);
+        auto &headers_entry = ListVector::GetChild(headers_vector);
         auto &body_vector = args.data[2];
 
         GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, STRING_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, body_vector, result, args.size(),
+            url_vector, headers_vector, body_vector, result,
             [&](STRING_TYPE url, LENTRY_TYPE headers, STRING_TYPE body)
             {
                 std::string url_str = url.val.GetString();
@@ -373,12 +372,12 @@ namespace duckdb
 
         auto &url_vector = args.data[0];
         auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetEntry(headers_vector);
+        auto &headers_entry = ListVector::GetChild(headers_vector);
         auto &body_vector = args.data[2];
-        auto &body_entry = ListVector::GetEntry(body_vector);
+        auto &body_entry = ListVector::GetChild(body_vector);
 
         GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, LENTRY_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, body_vector, result, args.size(),
+            url_vector, headers_vector, body_vector, result,
             [&](STRING_TYPE url, LENTRY_TYPE headers, LENTRY_TYPE params)
             {
                 std::string url_str = url.val.GetString();
@@ -426,33 +425,42 @@ namespace duckdb
     static ScalarFunction MakeVolatile(ScalarFunction fn)
     {
         fn.SetVolatile();
+        // Network failures are reported in the JSON result, but building the
+        // request (e.g. reading MAP arguments) can still raise; DuckDB 2.0
+        // requires such functions to be marked fallible.
+        fn.SetFallible();
         return fn;
     }
 
     static void LoadInternal(ExtensionLoader &loader)
     {
+        // Parameters are named so callers can keep using `headers => ...` / `params => ...` (DuckDB 2.0 only
+        // matches named arguments of scalar functions against declared parameter names).
+        const auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+
         ScalarFunctionSet http_head("http_head");
-        http_head.AddFunction(MakeVolatile(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPHeadRequestFunction)));
+        http_head.AddFunction(MakeVolatile(ScalarFunction({FunctionParameter("url", LogicalType::VARCHAR)}, LogicalType::JSON(), HTTPHeadRequestFunction)));
         loader.RegisterFunction(http_head);
 
         ScalarFunctionSet http_get("http_get");
-        http_get.AddFunction(MakeVolatile(ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), HTTPGetRequestFunction)));
+        http_get.AddFunction(MakeVolatile(ScalarFunction({FunctionParameter("url", LogicalType::VARCHAR)}, LogicalType::JSON(), HTTPGetRequestFunction)));
         http_get.AddFunction(MakeVolatile(ScalarFunction(
-            {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
-             LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
+            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
+             FunctionParameter("params", map_type)},
             LogicalType::JSON(), HTTPGetExRequestFunction)));
         loader.RegisterFunction(http_get);
 
         ScalarFunctionSet http_post("http_post");
         http_post.AddFunction(MakeVolatile(ScalarFunction(
-            {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR), LogicalType::JSON()},
+            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
+             FunctionParameter("params", LogicalType::JSON())},
             LogicalType::JSON(), HTTPPostRequestFunction)));
         loader.RegisterFunction(http_post);
 
         ScalarFunctionSet http_post_form("http_post_form");
         http_post_form.AddFunction(MakeVolatile(ScalarFunction(
-            {LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
-             LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
+            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
+             FunctionParameter("params", map_type)},
             LogicalType::JSON(), HTTPPostFormRequestFunction)));
         loader.RegisterFunction(http_post_form);
 
