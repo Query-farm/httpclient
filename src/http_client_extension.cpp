@@ -464,7 +464,7 @@ namespace duckdb
             LogicalType::JSON(), HTTPPostFormRequestFunction)));
         loader.RegisterFunction(http_post_form);
 
-        QueryFarmSendTelemetry(loader, "http_client", "2026072501");
+        QueryFarmSendTelemetry(loader, "http_client", "2026102001");
     }
 
     void HttpClientExtension::Load(ExtensionLoader &loader)
@@ -479,7 +479,7 @@ namespace duckdb
 
     std::string HttpClientExtension::Version() const
     {
-        return "2026072501";
+        return "2026102001";
     }
 
 } // namespace duckdb
