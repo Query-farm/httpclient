@@ -51,6 +51,15 @@ if(MINGW)
     list(APPEND COMMON_LIBS ${WIN_LIBS})
 endif()
 
+# macOS: the bundled httplib loads root certificates from the system keychain
+# (CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN is on by default with a TLS backend),
+# which needs CoreFoundation and Security. Matches duckdb-httpfs.
+if(APPLE)
+    find_library(COREFOUNDATION_FRAMEWORK CoreFoundation)
+    find_library(SECURITY_FRAMEWORK Security)
+    list(APPEND COMMON_LIBS ${COREFOUNDATION_FRAMEWORK} ${SECURITY_FRAMEWORK})
+endif()
+
 # Build extensions
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
