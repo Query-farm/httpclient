@@ -2,7 +2,7 @@ name: Main Extension Distribution Pipeline
 on:
   push:
     branches:
-    - v2.0
+    - v2.0-community-stub
   pull_request: null
   workflow_dispatch: null
 concurrency:
@@ -17,6 +17,5 @@ jobs:
       duckdb_version: v2.0-cyanoptera
       ci_tools_version: query-farm
       extension_name: http_client
-      exclude_archs: windows_amd64_mingw
     secrets:
       ccache_remote_token: ${{ secrets.QUERY_FARM_CCACHE_TOKEN }}

@@ -1,493 +1,172 @@
 #define DUCKDB_EXTENSION_MAIN
+
 #include "http_client_extension.hpp"
-#include "duckdb.hpp"
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/vector_operations/generic_executor.hpp"
-#include "duckdb/common/vector_operations/unary_executor.hpp"
-#include "duckdb/common/vector/list_vector.hpp"
-#include "duckdb/common/vector/string_vector.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include "duckdb/common/atomic.hpp"
-#include "duckdb/common/exception/http_exception.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
-#include "query_farm_telemetry.hpp"
-#ifdef USE_ZLIB
-#define CPPHTTPLIB_ZLIB_SUPPORT
-#endif
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/extension_load_options.hpp"
+#include "duckdb/main/extension_repository_manager.hpp"
 
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include "httplib.hpp"
+// For DuckDB 2.0 and later this extension is distributed from the Query.Farm extension repository. The build published to the
+// DuckDB community repository only keeps the name. When the user has already added the Query.Farm repository and
+// installed the extension from it, loading this build loads that one; otherwise it explains the remaining steps.
+// It never adds the repository or installs anything itself: trusting a repository is the user's decision.
 
-#include <string>
-#include <sstream>
+namespace duckdb {
 
-namespace duckdb
-{
+static constexpr const char *EXTENSION_NAME = "http_client";
+static constexpr const char *EXTENSION_VERSION = "2026102001";
+static constexpr const char *REPOSITORY_NAME = "query_farm";
+static constexpr const char *REPOSITORY_URL = "https://duckdb-extensions.query.farm";
+static constexpr const char *REPOSITORY_HTTP_URL = "http://duckdb-extensions.query.farm";
+// sha256 fingerprints of the Query.Farm repository signing keys (primary and standby)
+static constexpr const char *REPOSITORY_KEY_FINGERPRINTS[] = {
+    "sha256:b293ba6145db8f51f301618f59a720cb8c0c21e7efc6119aab43ea5c708947b5",
+    "sha256:6959de1c16b783b14d4c904f69361811f737017d79ea7078729a74ec2f7f7753"};
 
-    // Helper function to parse URL and setup client
-    static std::pair<duckdb_httplib_openssl::Client, std::string> SetupHttpClient(const std::string &url)
-    {
-        std::string scheme, domain, path, client_url;
-        size_t pos = url.find("://");
-        std::string mod_url = url;
-        if (pos != std::string::npos)
-        {
-            scheme = mod_url.substr(0, pos);
-            mod_url.erase(0, pos + 3);
-        }
+static string MovedPreamble() {
+	return StringUtil::Format("The %s extension for DuckDB 2.0 and later is distributed from the Query.Farm extension repository, "
+	                          "not the DuckDB community repository.\n\n",
+	                          EXTENSION_NAME);
+}
 
-        pos = mod_url.find("/");
-        if (pos != std::string::npos)
-        {
-            domain = mod_url.substr(0, pos);
-            path = mod_url.substr(pos);
-        }
-        else
-        {
-            domain = mod_url;
-            path = "/";
-        }
+static string MoreInformation() {
+	return StringUtil::Format("\n\nMore information: https://query.farm/products/extensions/%s/", EXTENSION_NAME);
+}
 
-        // Construct client url with scheme if specified
-        if (scheme.length() > 0)
-        {
-            client_url = scheme + "://" + domain;
-        }
-        else
-        {
-            client_url = domain;
-        }
+static bool IsInstalledFromRepository(DatabaseInstance &db, FileSystem &fs) {
+	for (auto &directory : ExtensionHelper::GetExtensionDirectoryPath(db, fs)) {
+		auto path = fs.JoinPath(fs.JoinPath(fs.JoinPath(directory, "repositories"), REPOSITORY_NAME),
+		                        string(EXTENSION_NAME) + ".duckdb_extension");
+		if (fs.FileExists(path)) {
+			return true;
+		}
+	}
+	return false;
+}
 
-        // Create client and set a reasonable timeout (e.g., 10 seconds)
-        duckdb_httplib_openssl::Client client(client_url);
-        client.set_read_timeout(10, 0);   // 10 seconds
-        client.set_follow_location(true); // Follow redirects
+// A repository named query_farm is only used when it points at the Query.Farm prefix and pins a Query.Farm signing key.
+static bool IsQueryFarmRepository(const ExtensionRepository &repository) {
+	auto prefix = StringUtil::Lower(repository.path);
+	while (StringUtil::EndsWith(prefix, "/")) {
+		prefix.pop_back();
+	}
+	if (prefix != REPOSITORY_URL && prefix != REPOSITORY_HTTP_URL) {
+		return false;
+	}
+	for (auto &key : repository.public_keys) {
+		auto fingerprint = ExtensionRepositoryManager::GetPublicKeyFingerprint(key);
+		for (auto trusted : REPOSITORY_KEY_FINGERPRINTS) {
+			if (fingerprint == trusted) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
 
-        return std::make_pair(std::move(client), path);
-    }
+static void LoadFromQueryFarmOrExplain(DatabaseInstance &db) {
+	auto &fs = FileSystem::GetFileSystem(db);
+	ExtensionRepository repository;
+	bool has_repository = ExtensionRepositoryManager::TryGetRepository(db, fs, REPOSITORY_NAME, repository);
 
-    // Helper function to escape chars of a string representing a JSON object
-    std::string escape_json(const std::string &input)
-    {
-        std::ostringstream output;
+	if (!has_repository) {
+		throw MissingExtensionException(
+		    "%sAdd the repository and install the extension once:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE EXTENSION REPOSITORY IF NOT EXISTS %s WITH PREFIX '%s';\n"
+		    "    INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME,
+		    REPOSITORY_NAME, MoreInformation());
+	}
+	if (!IsQueryFarmRepository(repository)) {
+		throw MissingExtensionException(
+		    "%sA repository named %s is configured with the prefix '%s', but it is not the Query.Farm extension "
+		    "repository: it points somewhere else or does not use the Query.Farm signing keys, so the extension is not "
+		    "loaded from it. Replace it with the Query.Farm repository and reinstall the extension:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, repository.path, REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME,
+		    REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
+	if (ExtensionRepositoryManager::GetAccess(db) == ExtensionRepositoryAccess::FORBIDDEN) {
+		throw MissingExtensionException("%sThe %s repository is configured, but allow_extension_repositories is set to "
+		                                "'forbidden', so extensions from it cannot be loaded.%s",
+		                                MovedPreamble(), REPOSITORY_NAME, MoreInformation());
+	}
+	if (!IsInstalledFromRepository(db, fs)) {
+		throw MissingExtensionException("%sThe %s repository is already configured. Install the extension from it once:\n"
+		                                "\n"
+		                                "    SET allow_extension_repositories = 'allowed';\n"
+		                                "    INSTALL %s FROM %s;\n"
+		                                "\n"
+		                                "Then load it in each session with:\n"
+		                                "\n"
+		                                "    LOAD %s FROM %s;%s",
+		                                MovedPreamble(), REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME,
+		                                EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
 
-        for (auto c = input.cbegin(); c != input.cend(); c++)
-        {
-            switch (*c)
-            {
-            case '"':
-                output << "\\\"";
-                break;
-            case '\\':
-                output << "\\\\";
-                break;
-            case '\b':
-                output << "\\b";
-                break;
-            case '\f':
-                output << "\\f";
-                break;
-            case '\n':
-                output << "\\n";
-                break;
-            case '\r':
-                output << "\\r";
-                break;
-            case '\t':
-                output << "\\t";
-                break;
-            default:
-                if ('\x00' <= *c && *c <= '\x1f')
-                {
-                    output << "\\u"
-                           << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(*c);
-                }
-                else
-                {
-                    output << *c;
-                }
-            }
-        }
-        return output.str();
-    }
+	// The repository is trusted and the extension is installed from it: load that build. DuckDB holds the load lock
+	// for this name while this stub initializes, so the real extension is loaded under an alias; its functions are
+	// registered as usual.
+	ExtensionLoadOptions options(EXTENSION_NAME);
+	options.repository = REPOSITORY_NAME;
+	options.alias = Identifier(string(EXTENSION_NAME) + "_" + REPOSITORY_NAME);
+	try {
+		ExtensionHelper::LoadExternalExtension(db, fs, options);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (error.Type() != ExceptionType::IO || !StringUtil::Contains(error.RawMessage(), "signature")) {
+			throw;
+		}
+		throw MissingExtensionException(
+		    "%sThe %s extension installed from the %s repository failed signature verification. The file may be "
+		    "damaged, or it was signed with a key that this repository definition does not trust. Reinstall it:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "If loading still fails the same way, refresh the repository's signing keys and reinstall:\n"
+		    "\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Do not use -unsigned to work around this.%s",
+		    MovedPreamble(), EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, REPOSITORY_NAME,
+		    REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
+}
 
-    // Helper function to create a Response object as a string
-    static std::string GetJsonResponse(int status, const std::string &reason, const std::string &body)
-    {
-        std::string response = StringUtil::Format(
-            "{ \"status\": %i, \"reason\": \"%s\", \"body\": \"%s\" }",
-            status,
-            escape_json(reason),
-            escape_json(body));
-        return response;
-    }
+void Http_clientExtension::Load(ExtensionLoader &loader) {
+	LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
+}
 
-    // Helper function to return the description of one HTTP error.
-    static std::string GetHttpErrorMessage(const duckdb_httplib_openssl::Result &res, const std::string &request_type)
-    {
-        std::string err_message = "HTTP " + request_type + " request failed. ";
+std::string Http_clientExtension::Name() {
+	return EXTENSION_NAME;
+}
 
-        switch (res.error())
-        {
-        case duckdb_httplib_openssl::Error::Connection:
-            err_message += "Connection error.";
-            break;
-        case duckdb_httplib_openssl::Error::BindIPAddress:
-            err_message += "Failed to bind IP address.";
-            break;
-        case duckdb_httplib_openssl::Error::Read:
-            err_message += "Error reading response.";
-            break;
-        case duckdb_httplib_openssl::Error::Write:
-            err_message += "Error writing request.";
-            break;
-        case duckdb_httplib_openssl::Error::ExceedRedirectCount:
-            err_message += "Too many redirects.";
-            break;
-        case duckdb_httplib_openssl::Error::Canceled:
-            err_message += "Request was canceled.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLConnection:
-            err_message += "SSL connection failed.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLLoadingCerts:
-            err_message += "Failed to load SSL certificates.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLServerVerification:
-            err_message += "SSL server verification failed.";
-            break;
-        case duckdb_httplib_openssl::Error::UnsupportedMultipartBoundaryChars:
-            err_message += "Unsupported characters in multipart boundary.";
-            break;
-        case duckdb_httplib_openssl::Error::Compression:
-            err_message += "Error during compression.";
-            break;
-        default:
-            err_message += "Unknown error.";
-            break;
-        }
-        return err_message;
-    }
-
-    // Helper function to convert list of entries to a map of parameters.
-    template <class T>
-    static int ConvertListEntryToMap(const list_entry_t &list_entry, const duckdb::Vector &input, T &result)
-    {
-        for (idx_t i = list_entry.offset; i < list_entry.offset + list_entry.length; i++)
-        {
-            const auto child_value = input.GetValue(i);
-            auto &children = StructValue::GetChildren(child_value);
-
-            if (children.size() == 2)
-            {
-                std::string key = children[0].IsNull() ? std::string() : children[0].ToString();
-                std::string val = children[1].IsNull() ? std::string() : children[1].ToString();
-                result.emplace(key, val);
-            }
-        }
-        return result.size();
-    }
-
-    std::string headers_to_string(const duckdb_httplib_openssl::Headers &headers)
-    {
-        std::string result = "{";
-
-        for (const auto &pair : headers)
-        {
-            const std::string &key = pair.first;
-            const std::string &value = pair.second;
-
-            std::string lower_key = key;
-            std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                           [](unsigned char c)
-                           { return std::tolower(c); });
-
-            result += "\"" + escape_json(lower_key) + "\":\"" + escape_json(value) + "\",";
-        }
-
-        if (result.length() > 1)
-        {
-            result.pop_back(); // Remove trailing comma
-        }
-        result += "}";
-
-        return result;
-    }
-
-    static void HTTPHeadRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 1);
-
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, [&](string_t input)
-                                                   {
-        std::string url = input.GetString();
-
-        // Use helper to setup client and parse URL
-        auto client_and_path = SetupHttpClient(url);
-        auto &client = client_and_path.first;
-        auto &path = client_and_path.second;
-
-        // Make the HEAD request
-        auto res = client.Head(path.c_str());
-        if (res) {
-            auto headers = headers_to_string(res->headers);
-            std::string response = StringUtil::Format(
-                "{ \"status\": %i, \"reason\": \"%s\", \"headers\": \"%s\" }",
-                res->status,
-                escape_json(res->reason),
-                escape_json(headers)
-            );
-            return StringVector::AddString(result, response);
-        } else {
-            std::string response = StringUtil::Format(
-                "{ \"status\": %i, \"reason\": \"%s\", \"headers\": \"%s\" }",
-                -1, GetHttpErrorMessage(res, "HEAD"), ""
-            );
-            return StringVector::AddString(result, response);
-        } });
-    }
-
-    static void HTTPGetRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 1);
-
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, [&](string_t input)
-                                                   {
-        std::string url = input.GetString();
-
-        // Use helper to setup client and parse URL
-        auto client_and_path = SetupHttpClient(url);
-        auto &client = client_and_path.first;
-        auto &path = client_and_path.second;
-
-        // Make the GET request
-        auto res = client.Get(path.c_str());
-        if (res) {
-            std::string response = GetJsonResponse(res->status, res->reason, res->body);
-            return StringVector::AddString(result, response);
-        } else {
-            std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "GET"), "");
-            return StringVector::AddString(result, response);
-        } });
-    }
-
-    static void HTTPGetExRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 3);
-
-        using STRING_TYPE = PrimitiveType<string_t>;
-        using LENTRY_TYPE = PrimitiveType<list_entry_t>;
-
-        auto &url_vector = args.data[0];
-        auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetChild(headers_vector);
-        auto &params_vector = args.data[2];
-        auto &params_entry = ListVector::GetChild(params_vector);
-
-        GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, LENTRY_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, params_vector, result,
-            [&](STRING_TYPE url, LENTRY_TYPE headers, LENTRY_TYPE params)
-            {
-                std::string url_str = url.val.GetString();
-
-                // Use helper to setup client and parse URL
-                auto client_and_path = SetupHttpClient(url_str);
-                auto &client = client_and_path.first;
-                auto &path = client_and_path.second;
-
-                // Prepare headers
-                duckdb_httplib_openssl::Headers header_map;
-                auto header_list = headers.val;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Headers>(header_list, headers_entry, header_map);
-
-                // Prepare params
-                duckdb_httplib_openssl::Params param_map;
-                auto params_list = params.val;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Params>(params_list, params_entry, param_map);
-
-                // Make the POST request with headers and params
-                auto res = client.Get(path.c_str(), param_map, header_map);
-                if (res)
-                {
-                    std::string response = GetJsonResponse(res->status, res->reason, res->body);
-                    return StringVector::AddString(result, response);
-                }
-                else
-                {
-                    std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "GET"), "");
-                    return StringVector::AddString(result, response);
-                }
-            });
-    }
-
-    static void HTTPPostRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 3);
-
-        using STRING_TYPE = PrimitiveType<string_t>;
-        using LENTRY_TYPE = PrimitiveType<list_entry_t>;
-
-        auto &url_vector = args.data[0];
-        auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetChild(headers_vector);
-        auto &body_vector = args.data[2];
-
-        GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, STRING_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, body_vector, result,
-            [&](STRING_TYPE url, LENTRY_TYPE headers, STRING_TYPE body)
-            {
-                std::string url_str = url.val.GetString();
-
-                // Use helper to setup client and parse URL
-                auto client_and_path = SetupHttpClient(url_str);
-                auto &client = client_and_path.first;
-                auto &path = client_and_path.second;
-
-                // Prepare headers
-                duckdb_httplib_openssl::Headers header_map;
-                auto header_list = headers.val;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Headers>(header_list, headers_entry, header_map);
-
-                // Make the POST request with headers and body
-                auto res = client.Post(path.c_str(), header_map, body.val.GetString(), "application/json");
-                if (res)
-                {
-                    std::string response = GetJsonResponse(res->status, res->reason, res->body);
-                    return StringVector::AddString(result, response);
-                }
-                else
-                {
-                    std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "POST"), "");
-                    return StringVector::AddString(result, response);
-                }
-            });
-    }
-
-    static void HTTPPostFormRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 3);
-
-        using STRING_TYPE = PrimitiveType<string_t>;
-        using LENTRY_TYPE = PrimitiveType<list_entry_t>;
-
-        auto &url_vector = args.data[0];
-        auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetChild(headers_vector);
-        auto &body_vector = args.data[2];
-        auto &body_entry = ListVector::GetChild(body_vector);
-
-        GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, LENTRY_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, body_vector, result,
-            [&](STRING_TYPE url, LENTRY_TYPE headers, LENTRY_TYPE params)
-            {
-                std::string url_str = url.val.GetString();
-
-                // Use helper to setup client and parse URL
-                auto client_and_path = SetupHttpClient(url_str);
-                auto &client = client_and_path.first;
-                auto &path = client_and_path.second;
-
-                // Prepare headers and parameters
-                duckdb_httplib_openssl::Headers header_map;
-                duckdb_httplib_openssl::Params params_map;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Headers>(headers.val, headers_entry, header_map);
-                ConvertListEntryToMap<duckdb_httplib_openssl::Params>(params.val, body_entry, params_map);
-
-                // Make the POST request with headers and params
-                auto res = client.Post(path.c_str(), header_map, params_map);
-                if (res)
-                {
-                    std::string response = GetJsonResponse(res->status, res->reason, res->body);
-                    return StringVector::AddString(result, response);
-                }
-                else
-                {
-                    std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "POST"), "");
-                    return StringVector::AddString(result, response);
-                }
-            });
-    }
-
-    // Every function here performs a network request — a side effect. Such
-    // functions MUST be VOLATILE, otherwise DuckDB's optimizer treats them as
-    // pure and may evaluate a call with all-constant arguments at plan time
-    // (constant folding) in addition to execution time. Concretely, nesting a
-    // call inside a larger constant expression — the common idiom
-    //   SELECT http_post('http://…', …)->>'access_token'
-    // — sends the request TWICE on one query. The query result is still a
-    // single correct row, so the duplicate is only visible in the server's
-    // logs; for non-idempotent endpoints (OAuth code exchange, webhooks,
-    // POSTs that create rows) it is a correctness bug. Marking the functions
-    // volatile (same class as random()/nextval()) pins one request per
-    // logical call. Verified: nested constant-arg http_post sends 2 without
-    // volatile, exactly 1 with it; column/bind arguments already sent once
-    // and are unaffected.
-    static ScalarFunction MakeVolatile(ScalarFunction fn)
-    {
-        fn.SetVolatile();
-        // Network failures are reported in the JSON result, but building the
-        // request (e.g. reading MAP arguments) can still raise; DuckDB 2.0
-        // requires such functions to be marked fallible.
-        fn.SetFallible();
-        return fn;
-    }
-
-    static void LoadInternal(ExtensionLoader &loader)
-    {
-        // Parameters are named so callers can keep using `headers => ...` / `params => ...` (DuckDB 2.0 only
-        // matches named arguments of scalar functions against declared parameter names).
-        const auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-
-        ScalarFunctionSet http_head("http_head");
-        http_head.AddFunction(MakeVolatile(ScalarFunction({FunctionParameter("url", LogicalType::VARCHAR)}, LogicalType::JSON(), HTTPHeadRequestFunction)));
-        loader.RegisterFunction(http_head);
-
-        ScalarFunctionSet http_get("http_get");
-        http_get.AddFunction(MakeVolatile(ScalarFunction({FunctionParameter("url", LogicalType::VARCHAR)}, LogicalType::JSON(), HTTPGetRequestFunction)));
-        http_get.AddFunction(MakeVolatile(ScalarFunction(
-            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
-             FunctionParameter("params", map_type)},
-            LogicalType::JSON(), HTTPGetExRequestFunction)));
-        loader.RegisterFunction(http_get);
-
-        ScalarFunctionSet http_post("http_post");
-        http_post.AddFunction(MakeVolatile(ScalarFunction(
-            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
-             FunctionParameter("params", LogicalType::JSON())},
-            LogicalType::JSON(), HTTPPostRequestFunction)));
-        loader.RegisterFunction(http_post);
-
-        ScalarFunctionSet http_post_form("http_post_form");
-        http_post_form.AddFunction(MakeVolatile(ScalarFunction(
-            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
-             FunctionParameter("params", map_type)},
-            LogicalType::JSON(), HTTPPostFormRequestFunction)));
-        loader.RegisterFunction(http_post_form);
-
-        QueryFarmSendTelemetry(loader, "http_client", "2026102002");
-    }
-
-    void HttpClientExtension::Load(ExtensionLoader &loader)
-    {
-        LoadInternal(loader);
-    }
-
-    std::string HttpClientExtension::Name()
-    {
-        return "http_client";
-    }
-
-    std::string HttpClientExtension::Version() const
-    {
-        return "2026102002";
-    }
+std::string Http_clientExtension::Version() const {
+	return EXTENSION_VERSION;
+}
 
 } // namespace duckdb
 
-extern "C"
-{
-    DUCKDB_CPP_EXTENSION_ENTRY(http_client, loader)
-    {
-        duckdb::LoadInternal(loader);
-    }
+extern "C" {
+
+DUCKDB_CPP_EXTENSION_ENTRY(http_client, loader) {
+	duckdb::LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
+}
 }
