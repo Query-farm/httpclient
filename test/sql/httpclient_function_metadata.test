@@ -1,0 +1,30 @@
+# name: test/sql/httpclient_function_metadata.test
+# description: every http_client function has a description, examples, categories and parameter names
+# group: [http_client]
+
+require http_client
+
+query I
+SELECT list(DISTINCT function_name ORDER BY function_name) FROM duckdb_functions()
+WHERE function_name IN ('http_head', 'http_get', 'http_post', 'http_post_form', 'http_put', 'http_delete')
+  AND (description IS NULL OR description = ''
+       OR examples IS NULL OR len(examples) = 0
+       OR categories IS NULL OR len(categories) = 0);
+----
+NULL
+
+query IIIII
+SELECT function_name, parameters, parameter_types, return_type, stability FROM duckdb_functions()
+WHERE function_name LIKE 'http\_%' ESCAPE '\' ORDER BY function_name;
+----
+http_delete	[url, headers]	[VARCHAR, 'MAP(VARCHAR, VARCHAR)']	JSON	VOLATILE
+http_get	[url, headers, params]	[VARCHAR, 'MAP(VARCHAR, VARCHAR)', 'MAP(VARCHAR, VARCHAR)']	JSON	VOLATILE
+http_head	[url, headers]	[VARCHAR, 'MAP(VARCHAR, VARCHAR)']	JSON	VOLATILE
+http_post	[url, headers, body, params]	[VARCHAR, 'MAP(VARCHAR, VARCHAR)', JSON, JSON]	JSON	VOLATILE
+http_post_form	[url, headers, params]	[VARCHAR, 'MAP(VARCHAR, VARCHAR)', 'MAP(VARCHAR, VARCHAR)']	JSON	VOLATILE
+http_put	[url, headers, body]	[VARCHAR, 'MAP(VARCHAR, VARCHAR)', JSON]	JSON	VOLATILE
+
+query II
+SELECT DISTINCT categories, len(examples) > 0 FROM duckdb_functions() WHERE function_name LIKE 'http\_%' ESCAPE '\';
+----
+[http, network]	true

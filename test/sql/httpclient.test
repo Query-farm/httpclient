@@ -1,5 +1,5 @@
 # name: test/sql/httpclient.test
-# description: test http_client extension
+# description: offline tests for the http_client extension (no network access needed)
 # group: [http_client]
 
 # Before we load the extension, this will fail
@@ -8,193 +8,115 @@ SELECT http_get('Sam');
 ----
 Catalog Error: Scalar Function with name http_get does not exist!
 
-# Require statement will ensure this test is run with this extension loaded
 require http_client
 
 require json
 
-# Confirm the GET extension works
-query III
-WITH __input AS (
-  SELECT
-    http_get(
-        'https://httpbin.org/get'
-    ) AS res
-),
-__response AS (
-  SELECT
-    (res->>'status')::INT AS status,
-    (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
-  FROM
-    __input
-)
-SELECT
-  __response.status,
-  __response.reason,
-  __response.Host AS host
-FROM
-  __response
-;
+# A NULL url gives NULL without sending anything; NULL headers/params/body mean "none"
+query IIIIII
+SELECT http_get(NULL) IS NULL, http_head(NULL) IS NULL, http_post(NULL, NULL, NULL) IS NULL,
+       http_post_form(NULL) IS NULL, http_put(NULL) IS NULL, http_delete(NULL) IS NULL;
 ----
-200	OK	httpbin.org
+true	true	true	true	true	true
 
-# Confirm the GET extension works with headers and params
-query III
-WITH __input AS (
-  SELECT
-    http_get(
-        'https://httpbin.org/get',
-        headers => MAP {
-          'accept': 'application/json',
-        },
-        params => MAP {
-          'limit': 10
-        }
-    ) AS res
-),
-__response AS (
-  SELECT
-    (res->>'status')::INT AS status,
-    (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
-  FROM
-    __input
-)
-SELECT
-  __response.status,
-  __response.reason,
-  __response.Host AS host
-FROM
-  __response
-;
-----
-200	OK	httpbin.org
-
-# Confirm the POST extension works
-query III
-WITH __input AS (
-  SELECT
-    http_post(
-        'https://httpbin.org/post',
-        headers => MAP {
-          'accept': 'application/json',
-        },
-        params => MAP {
-        }
-    ) AS res
-),
-__response AS (
-  SELECT
-    (res->>'status')::INT AS status,
-    (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
-  FROM
-    __input
-)
-SELECT
-  __response.status,
-  __response.reason,
-  __response.Host AS host
-FROM
-  __response
-;
-----
-200	OK	httpbin.org
-
-# Confirm the POST extension works with headers and params
 query I
-WITH __input AS (
-  SELECT
-    http_post(
-      'https://earth-search.aws.element84.com/v0/search',
-      headers => MAP {
-        'Content-Type': 'application/json',
-        'Accept-Encoding': 'gzip',
-        'Accept': 'application/geo+json'
-      },
-      params => {
-        'collections': ['sentinel-s2-l2a-cogs'],
-        'ids': ['S2A_56LPN_20210930_0_L2A'],
-        'datetime': '2021-09-30/2021-09-30',
-        'limit': 10
-      }
-    ) AS res
-),
-__response AS (
-  SELECT
-    unnest( from_json(((res->>'body')::JSON)->'features', '["json"]') ) AS features
-  FROM
-    __input
-)
-SELECT
-  features->>'id' AS id
-FROM
-  __response
-;
+SELECT count(*) FROM (SELECT http_get(u) AS r FROM (VALUES (NULL::VARCHAR), (NULL)) t(u)) WHERE r IS NULL;
 ----
-S2A_56LPN_20210930_0_L2A
+2
 
-# Confirm the POST function with form request works
-query III
-WITH __input AS (
-  SELECT
-    http_post_form(
-        'https://httpbin.org/post',
-        headers => MAP {
-          'accept': 'application/json',
-        },
-        params => MAP {
-          'limit': 10
-        }
-    ) AS res
-),
-__response AS (
-  SELECT
-    (res->>'status')::INT AS status,
-    (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'headers', '{"Host": "VARCHAR"}') ) AS features
-  FROM
-    __input
-)
-SELECT
-  __response.status,
-  __response.reason,
-  __response.Host AS host
-FROM
-  __response
-;
+# Only http:// and https:// URLs are accepted
+statement error
+SELECT http_get('ftp://example.com/file');
 ----
-200	OK	httpbin.org
+only http:// and https:// URLs are supported
 
-# Confirm the POST function with form encoding transmits a single value
-query III
-WITH __input AS (
-  SELECT
-    http_post_form(
-        'https://httpbin.org/post',
-        headers => MAP {
-          'accept': 'application/json',
-        },
-        params => MAP {
-          'limit': 10
-        }
-    ) AS res
-),
-__response AS (
-  SELECT
-    (res->>'status')::INT AS status,
-    (res->>'reason') AS reason,
-    unnest( from_json(((res->>'body')::JSON)->'form', '{"limit": "VARCHAR"}') ) AS features
-  FROM
-    __input
-)
-SELECT
-  __response.status,
-  __response.reason,
-  __response.limit AS limit
-FROM
-  __response
-;
+statement error
+SELECT http_get('file:///etc/passwd');
 ----
-200	OK	10
+only http:// and https:// URLs are supported
+
+statement error
+SELECT http_get('http://');
+----
+has no host
+
+statement error
+SELECT http_get('http:///path');
+----
+has no host
+
+statement error
+SELECT http_get('http://example.com/a b');
+----
+contains whitespace or control characters
+
+statement error
+SELECT http_get('http://example.com/' || chr(10));
+----
+contains whitespace or control characters
+
+# Header injection is refused
+statement error
+SELECT http_get('http://127.0.0.1:1/', headers => MAP {'X-Test': 'a' || chr(13) || chr(10) || 'Injected: yes'});
+----
+contains a line break or NUL byte
+
+statement error
+SELECT http_get('http://127.0.0.1:1/', headers => MAP {'Bad Name': 'x'});
+----
+invalid HTTP header name
+
+statement error
+SELECT http_get('http://127.0.0.1:1/', headers => MAP {'': 'x'});
+----
+header names must not be empty
+
+# The body can be passed as body or (deprecated) params, not both
+statement error
+SELECT http_post('http://127.0.0.1:1/', body => {'a': 1}, params => {'b': 2});
+----
+either body or params
+
+# No server: the request error is reported in the JSON result (status -1)
+query II
+SELECT (r->>'status')::INT, r->>'reason' LIKE 'HTTP GET request failed.%'
+FROM (SELECT http_get('http://127.0.0.1:1/nothing') AS r);
+----
+-1	true
+
+query III
+SELECT (r->>'status')::INT, r->>'body', (r->'headers')::VARCHAR
+FROM (SELECT http_get('http://127.0.0.1:1/', headers => MAP {'Accept': 'text/plain'}, params => MAP {'q': 'x y'}) AS r);
+----
+-1	(empty)	{}
+
+# Column (non-constant) arguments: one request per row
+query II
+SELECT u, (http_get(u)->>'status')::INT
+FROM (VALUES ('http://127.0.0.1:1/a'), (NULL), ('127.0.0.1:1/scheme-less')) t(u) ORDER BY u NULLS LAST;
+----
+127.0.0.1:1/scheme-less	-1
+http://127.0.0.1:1/a	-1
+NULL	NULL
+
+# Every function is volatile, so calls with constant arguments are never folded at plan time
+query I
+SELECT list(DISTINCT stability) FROM duckdb_functions() WHERE function_name LIKE 'http\_%' ESCAPE '\';
+----
+[VOLATILE]
+
+# Settings
+query II
+SELECT current_setting('http_client_max_response_size'), current_setting('http_client_max_redirects');
+----
+104857600	10
+
+statement ok
+SET http_client_max_response_size = 1024;
+
+statement ok
+SET http_client_max_redirects = 0;
+
+statement error
+SET http_client_max_redirects = -1;
+----

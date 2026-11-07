@@ -1,493 +1,872 @@
 #define DUCKDB_EXTENSION_MAIN
 #include "http_client_extension.hpp"
+
 #include "duckdb.hpp"
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/vector_operations/generic_executor.hpp"
-#include "duckdb/common/vector_operations/unary_executor.hpp"
-#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/http_exception.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/common/atomic.hpp"
-#include "duckdb/common/exception/http_exception.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
-#include "query_farm_telemetry.hpp"
-#ifdef USE_ZLIB
-#define CPPHTTPLIB_ZLIB_SUPPORT
-#endif
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/http/http_util.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include "httplib.hpp"
+#include "query_farm_telemetry.hpp"
 
 #include <string>
-#include <sstream>
 
-namespace duckdb
-{
+namespace duckdb {
 
-    // Helper function to parse URL and setup client
-    static std::pair<duckdb_httplib_openssl::Client, std::string> SetupHttpClient(const std::string &url)
-    {
-        std::string scheme, domain, path, client_url;
-        size_t pos = url.find("://");
-        std::string mod_url = url;
-        if (pos != std::string::npos)
-        {
-            scheme = mod_url.substr(0, pos);
-            mod_url.erase(0, pos + 3);
-        }
+//! The extension version, reported by Version() and sent with the telemetry ping.
+static constexpr const char *HTTP_CLIENT_VERSION = "2026110701";
 
-        pos = mod_url.find("/");
-        if (pos != std::string::npos)
-        {
-            domain = mod_url.substr(0, pos);
-            path = mod_url.substr(pos);
-        }
-        else
-        {
-            domain = mod_url;
-            path = "/";
-        }
+static constexpr const char *MAX_RESPONSE_SIZE_SETTING = "http_client_max_response_size";
+static constexpr idx_t DEFAULT_MAX_RESPONSE_SIZE = 100ULL * 1024ULL * 1024ULL; // 100 MiB
+static constexpr const char *MAX_REDIRECTS_SETTING = "http_client_max_redirects";
+static constexpr idx_t DEFAULT_MAX_REDIRECTS = 10;
 
-        // Construct client url with scheme if specified
-        if (scheme.length() > 0)
-        {
-            client_url = scheme + "://" + domain;
-        }
-        else
-        {
-            client_url = domain;
-        }
+// CamelCase: DELETE is a macro in <winnt.h>
+enum class HttpMethod { Head, Get, Post, PostForm, Put, Delete };
 
-        // Create client and set a reasonable timeout (e.g., 10 seconds)
-        duckdb_httplib_openssl::Client client(client_url);
-        client.set_read_timeout(10, 0);   // 10 seconds
-        client.set_follow_location(true); // Follow redirects
+static const char *MethodName(HttpMethod method) {
+	switch (method) {
+	case HttpMethod::Head:
+		return "HEAD";
+	case HttpMethod::Get:
+		return "GET";
+	case HttpMethod::Post:
+	case HttpMethod::PostForm:
+		return "POST";
+	case HttpMethod::Put:
+		return "PUT";
+	case HttpMethod::Delete:
+		return "DELETE";
+	}
+	return "GET";
+}
 
-        return std::make_pair(std::move(client), path);
-    }
+//===--------------------------------------------------------------------===//
+// Text helpers
+//===--------------------------------------------------------------------===//
 
-    // Helper function to escape chars of a string representing a JSON object
-    std::string escape_json(const std::string &input)
-    {
-        std::ostringstream output;
+// Length of the valid UTF-8 sequence starting at s[i], or 0 if it is not valid (overlong forms, surrogates and
+// code points above U+10FFFF are rejected).
+static idx_t Utf8SequenceLength(const string &s, idx_t i) {
+	auto c = static_cast<unsigned char>(s[i]);
+	if (c < 0x80) {
+		return 1;
+	}
+	idx_t len;
+	uint32_t cp;
+	if (c >= 0xC2 && c <= 0xDF) {
+		len = 2;
+		cp = c & 0x1F;
+	} else if (c >= 0xE0 && c <= 0xEF) {
+		len = 3;
+		cp = c & 0x0F;
+	} else if (c >= 0xF0 && c <= 0xF4) {
+		len = 4;
+		cp = c & 0x07;
+	} else {
+		return 0;
+	}
+	if (i + len > s.size()) {
+		return 0;
+	}
+	for (idx_t k = 1; k < len; k++) {
+		auto cc = static_cast<unsigned char>(s[i + k]);
+		if ((cc & 0xC0) != 0x80) {
+			return 0;
+		}
+		cp = (cp << 6) | (cc & 0x3F);
+	}
+	if ((len == 3 && cp < 0x800) || (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) || (cp >= 0xD800 && cp <= 0xDFFF)) {
+		return 0;
+	}
+	return len;
+}
 
-        for (auto c = input.cbegin(); c != input.cend(); c++)
-        {
-            switch (*c)
-            {
-            case '"':
-                output << "\\\"";
-                break;
-            case '\\':
-                output << "\\\\";
-                break;
-            case '\b':
-                output << "\\b";
-                break;
-            case '\f':
-                output << "\\f";
-                break;
-            case '\n':
-                output << "\\n";
-                break;
-            case '\r':
-                output << "\\r";
-                break;
-            case '\t':
-                output << "\\t";
-                break;
-            default:
-                if ('\x00' <= *c && *c <= '\x1f')
-                {
-                    output << "\\u"
-                           << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(*c);
-                }
-                else
-                {
-                    output << *c;
-                }
-            }
-        }
-        return output.str();
-    }
+static bool IsValidUtf8(const string &s) {
+	for (idx_t i = 0; i < s.size();) {
+		auto len = Utf8SequenceLength(s, i);
+		if (len == 0) {
+			return false;
+		}
+		i += len;
+	}
+	return true;
+}
 
-    // Helper function to create a Response object as a string
-    static std::string GetJsonResponse(int status, const std::string &reason, const std::string &body)
-    {
-        std::string response = StringUtil::Format(
-            "{ \"status\": %i, \"reason\": \"%s\", \"body\": \"%s\" }",
-            status,
-            escape_json(reason),
-            escape_json(body));
-        return response;
-    }
+// Replaces every byte that is not part of a valid UTF-8 sequence with U+FFFD (for reasons and header values).
+static string SanitizeUtf8(const string &s) {
+	if (IsValidUtf8(s)) {
+		return s;
+	}
+	string out;
+	for (idx_t i = 0; i < s.size();) {
+		auto len = Utf8SequenceLength(s, i);
+		if (len == 0) {
+			out += "\xEF\xBF\xBD";
+			i++;
+		} else {
+			out.append(s, i, len);
+			i += len;
+		}
+	}
+	return out;
+}
 
-    // Helper function to return the description of one HTTP error.
-    static std::string GetHttpErrorMessage(const duckdb_httplib_openssl::Result &res, const std::string &request_type)
-    {
-        std::string err_message = "HTTP " + request_type + " request failed. ";
+// Escapes a (valid UTF-8) string for use inside a JSON string literal.
+static string EscapeJson(const string &input) {
+	string output;
+	output.reserve(input.size() + 16);
+	for (auto ch : input) {
+		auto c = static_cast<unsigned char>(ch);
+		switch (c) {
+		case '"':
+			output += "\\\"";
+			break;
+		case '\\':
+			output += "\\\\";
+			break;
+		case '\b':
+			output += "\\b";
+			break;
+		case '\f':
+			output += "\\f";
+			break;
+		case '\n':
+			output += "\\n";
+			break;
+		case '\r':
+			output += "\\r";
+			break;
+		case '\t':
+			output += "\\t";
+			break;
+		default:
+			if (c < 0x20 || c == 0x7f) {
+				output += StringUtil::Format("\\u%04x", static_cast<int>(c));
+			} else {
+				output += ch;
+			}
+		}
+	}
+	return output;
+}
 
-        switch (res.error())
-        {
-        case duckdb_httplib_openssl::Error::Connection:
-            err_message += "Connection error.";
-            break;
-        case duckdb_httplib_openssl::Error::BindIPAddress:
-            err_message += "Failed to bind IP address.";
-            break;
-        case duckdb_httplib_openssl::Error::Read:
-            err_message += "Error reading response.";
-            break;
-        case duckdb_httplib_openssl::Error::Write:
-            err_message += "Error writing request.";
-            break;
-        case duckdb_httplib_openssl::Error::ExceedRedirectCount:
-            err_message += "Too many redirects.";
-            break;
-        case duckdb_httplib_openssl::Error::Canceled:
-            err_message += "Request was canceled.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLConnection:
-            err_message += "SSL connection failed.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLLoadingCerts:
-            err_message += "Failed to load SSL certificates.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLServerVerification:
-            err_message += "SSL server verification failed.";
-            break;
-        case duckdb_httplib_openssl::Error::UnsupportedMultipartBoundaryChars:
-            err_message += "Unsupported characters in multipart boundary.";
-            break;
-        case duckdb_httplib_openssl::Error::Compression:
-            err_message += "Error during compression.";
-            break;
-        default:
-            err_message += "Unknown error.";
-            break;
-        }
-        return err_message;
-    }
+static bool IsUnreserved(unsigned char c) {
+	return StringUtil::CharacterIsAlphaNumeric(static_cast<char>(c)) || c == '-' || c == '_' || c == '.' || c == '~';
+}
 
-    // Helper function to convert list of entries to a map of parameters.
-    template <class T>
-    static int ConvertListEntryToMap(const list_entry_t &list_entry, const duckdb::Vector &input, T &result)
-    {
-        for (idx_t i = list_entry.offset; i < list_entry.offset + list_entry.length; i++)
-        {
-            const auto child_value = input.GetValue(i);
-            auto &children = StructValue::GetChildren(child_value);
+// Percent-encodes everything except RFC 3986 unreserved characters (query parameters and form bodies).
+static string PercentEncode(const string &input) {
+	static const char *HEX = "0123456789ABCDEF";
+	string out;
+	for (auto ch : input) {
+		auto c = static_cast<unsigned char>(ch);
+		if (IsUnreserved(c)) {
+			out += ch;
+		} else {
+			out += '%';
+			out += HEX[c >> 4];
+			out += HEX[c & 0x0F];
+		}
+	}
+	return out;
+}
 
-            if (children.size() == 2)
-            {
-                std::string key = children[0].IsNull() ? std::string() : children[0].ToString();
-                std::string val = children[1].IsNull() ? std::string() : children[1].ToString();
-                result.emplace(key, val);
-            }
-        }
-        return result.size();
-    }
+static int HexValue(char c) {
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	return -1;
+}
 
-    std::string headers_to_string(const duckdb_httplib_openssl::Headers &headers)
-    {
-        std::string result = "{";
+static string PercentDecode(const string &input) {
+	string out;
+	for (idx_t i = 0; i < input.size(); i++) {
+		if (input[i] == '%' && i + 2 < input.size()) {
+			auto hi = HexValue(input[i + 1]);
+			auto lo = HexValue(input[i + 2]);
+			if (hi >= 0 && lo >= 0) {
+				out += static_cast<char>(hi * 16 + lo);
+				i += 2;
+				continue;
+			}
+		}
+		out += input[i];
+	}
+	return out;
+}
 
-        for (const auto &pair : headers)
-        {
-            const std::string &key = pair.first;
-            const std::string &value = pair.second;
+//===--------------------------------------------------------------------===//
+// Settings and policy
+//===--------------------------------------------------------------------===//
 
-            std::string lower_key = key;
-            std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                           [](unsigned char c)
-                           { return std::tolower(c); });
+static idx_t GetUBigIntSetting(ClientContext &context, const char *name, idx_t default_value) {
+	Value value;
+	if (context.TryGetCurrentSetting(name, value) && !value.IsNull()) {
+		return UBigIntValue::Get(value.DefaultCastAs(LogicalType::UBIGINT));
+	}
+	return default_value;
+}
 
-            result += "\"" + escape_json(lower_key) + "\":\"" + escape_json(value) + "\",";
-        }
+static void CheckExternalAccess(ClientContext &context, HttpMethod method) {
+	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
+		throw PermissionException("http_client: HTTP %s requests are disabled because enable_external_access is false",
+		                          MethodName(method));
+	}
+}
 
-        if (result.length() > 1)
-        {
-            result.pop_back(); // Remove trailing comma
-        }
-        result += "}";
+struct ParsedUrl {
+	//! The URL that is sent (no userinfo, no fragment)
+	string url;
+	bool https = false;
+	//! user:password from the URL, percent-decoded, if there was one
+	bool has_userinfo = false;
+	string userinfo;
+};
 
-        return result;
-    }
+// Validates an http(s) URL and splits off userinfo and the fragment. A URL without a scheme is treated as
+// http://, as earlier versions of the extension did.
+static ParsedUrl ParseUrl(const string &input) {
+	for (auto ch : input) {
+		auto c = static_cast<unsigned char>(ch);
+		if (c <= 0x20 || c == 0x7f) {
+			throw InvalidInputException("http_client: URL \"%s\" contains whitespace or control characters - "
+			                            "percent-encode them",
+			                            SanitizeUtf8(input));
+		}
+	}
+	ParsedUrl result;
+	string rest;
+	auto scheme_end = input.find("://");
+	if (scheme_end == string::npos) {
+		rest = input;
+	} else {
+		auto scheme = StringUtil::Lower(input.substr(0, scheme_end));
+		if (scheme == "https") {
+			result.https = true;
+		} else if (scheme != "http") {
+			throw InvalidInputException("http_client: unsupported URL scheme \"%s\" - only http:// and https:// URLs "
+			                            "are supported",
+			                            SanitizeUtf8(input.substr(0, scheme_end)));
+		}
+		rest = input.substr(scheme_end + 3);
+	}
+	auto fragment = rest.find('#');
+	if (fragment != string::npos) {
+		rest = rest.substr(0, fragment);
+	}
+	auto authority_end = rest.find_first_of("/?");
+	auto authority = rest.substr(0, authority_end);
+	auto path = authority_end == string::npos ? string("/") : rest.substr(authority_end);
+	if (!path.empty() && path[0] == '?') {
+		path = "/" + path;
+	}
+	auto at = authority.rfind('@');
+	if (at != string::npos) {
+		result.has_userinfo = true;
+		result.userinfo = PercentDecode(authority.substr(0, at));
+		authority = authority.substr(at + 1);
+	}
+	if (authority.empty()) {
+		throw InvalidInputException("http_client: URL \"%s\" has no host", SanitizeUtf8(input));
+	}
+	result.url = (result.https ? "https://" : "http://") + authority + path;
+	return result;
+}
 
-    static void HTTPHeadRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 1);
+static string ProtoHostPort(const string &url) {
+	string path, proto_host_port;
+	HTTPUtil::DecomposeURL(url, path, proto_host_port);
+	return StringUtil::Lower(proto_host_port);
+}
 
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, [&](string_t input)
-                                                   {
-        std::string url = input.GetString();
+// Resolves a Location header against the URL that returned it.
+static string ResolveRedirect(const string &base_url, const string &location) {
+	auto lower = StringUtil::Lower(location);
+	if (lower.find("://") != string::npos) {
+		return location;
+	}
+	string path, proto_host_port;
+	HTTPUtil::DecomposeURL(base_url, path, proto_host_port);
+	if (StringUtil::StartsWith(location, "//")) {
+		return base_url.substr(0, base_url.find("://") + 1) + location;
+	}
+	if (StringUtil::StartsWith(location, "/")) {
+		return proto_host_port + location;
+	}
+	auto dir = path.substr(0, path.find('?'));
+	auto slash = dir.rfind('/');
+	dir = slash == string::npos ? "/" : dir.substr(0, slash + 1);
+	return proto_host_port + dir + location;
+}
 
-        // Use helper to setup client and parse URL
-        auto client_and_path = SetupHttpClient(url);
-        auto &client = client_and_path.first;
-        auto &path = client_and_path.second;
+static bool IsRedirect(HTTPStatusCode status) {
+	switch (status) {
+	case HTTPStatusCode::MovedPermanently_301:
+	case HTTPStatusCode::Found_302:
+	case HTTPStatusCode::SeeOther_303:
+	case HTTPStatusCode::TemporaryRedirect_307:
+	case HTTPStatusCode::PermanentRedirect_308:
+		return true;
+	default:
+		return false;
+	}
+}
 
-        // Make the HEAD request
-        auto res = client.Head(path.c_str());
-        if (res) {
-            auto headers = headers_to_string(res->headers);
-            std::string response = StringUtil::Format(
-                "{ \"status\": %i, \"reason\": \"%s\", \"headers\": \"%s\" }",
-                res->status,
-                escape_json(res->reason),
-                escape_json(headers)
-            );
-            return StringVector::AddString(result, response);
-        } else {
-            std::string response = StringUtil::Format(
-                "{ \"status\": %i, \"reason\": \"%s\", \"headers\": \"%s\" }",
-                -1, GetHttpErrorMessage(res, "HEAD"), ""
-            );
-            return StringVector::AddString(result, response);
-        } });
-    }
+// DuckDB's built-in HTTP client only speaks plain-HTTP GET. https:// and every other method need httpfs, which
+// DuckDB autoloads when it is installed (or installable).
+static HTTPUtil &GetHttpUtil(ClientContext &context, bool https, HttpMethod method) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	auto &http_util = HTTPUtil::Get(db);
+#ifndef __EMSCRIPTEN__
+	if (http_util.GetName() == "Built-In" && (https || method != HttpMethod::Get)) {
+		ExtensionHelper::TryAutoLoadExtension(context, "httpfs");
+		auto &loaded_util = HTTPUtil::Get(db);
+		if (loaded_util.GetName() == "Built-In") {
+			throw MissingExtensionException("http_client needs the httpfs extension %s. Run INSTALL httpfs; LOAD "
+			                                "httpfs; and try again",
+			                                https ? string("for https:// URLs")
+			                                      : StringUtil::Format("for HTTP %s requests", MethodName(method)));
+		}
+		return loaded_util;
+	}
+#endif
+	return http_util;
+}
 
-    static void HTTPGetRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 1);
+//===--------------------------------------------------------------------===//
+// Requests
+//===--------------------------------------------------------------------===//
 
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, [&](string_t input)
-                                                   {
-        std::string url = input.GetString();
+using HeaderList = vector<std::pair<string, string>>;
 
-        // Use helper to setup client and parse URL
-        auto client_and_path = SetupHttpClient(url);
-        auto &client = client_and_path.first;
-        auto &path = client_and_path.second;
+struct HttpRequestSpec {
+	HttpMethod method;
+	string url;
+	HeaderList headers;
+	string body;
+	//! Content-Type sent with a body unless the caller set one
+	string default_content_type;
+};
 
-        // Make the GET request
-        auto res = client.Get(path.c_str());
-        if (res) {
-            std::string response = GetJsonResponse(res->status, res->reason, res->body);
-            return StringVector::AddString(result, response);
-        } else {
-            std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "GET"), "");
-            return StringVector::AddString(result, response);
-        } });
-    }
+struct HttpResult {
+	//! false when no HTTP response was received (connection refused, timeout, TLS failure, ...)
+	bool ok = false;
+	int status = -1;
+	string reason;
+	string body;
+	HeaderList headers;
+};
 
-    static void HTTPGetExRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 3);
+static bool HasHeader(const HeaderList &headers, const string &name) {
+	for (auto &h : headers) {
+		if (StringUtil::CIEquals(h.first, name)) {
+			return true;
+		}
+	}
+	return false;
+}
 
-        using STRING_TYPE = PrimitiveType<string_t>;
-        using LENTRY_TYPE = PrimitiveType<list_entry_t>;
+static void RemoveHeader(HeaderList &headers, const string &name) {
+	HeaderList kept;
+	for (auto &h : headers) {
+		if (!StringUtil::CIEquals(h.first, name)) {
+			kept.push_back(h);
+		}
+	}
+	headers = std::move(kept);
+}
 
-        auto &url_vector = args.data[0];
-        auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetChild(headers_vector);
-        auto &params_vector = args.data[2];
-        auto &params_entry = ListVector::GetChild(params_vector);
+static void ValidateHeader(const string &name, const string &value) {
+	if (name.empty()) {
+		throw InvalidInputException("http_client: header names must not be empty");
+	}
+	for (auto ch : name) {
+		auto c = static_cast<unsigned char>(ch);
+		if (c <= 0x20 || c >= 0x7f || ch == ':' || ch == '(' || ch == ')' || ch == ',' || ch == ';' || ch == '<' ||
+		    ch == '>' || ch == '=' || ch == '@' || ch == '[' || ch == ']' || ch == '{' || ch == '}' || ch == '"' ||
+		    ch == '/' || ch == '?' || ch == '\\') {
+			throw InvalidInputException("http_client: invalid HTTP header name \"%s\"", SanitizeUtf8(name));
+		}
+	}
+	for (auto ch : value) {
+		if (ch == '\r' || ch == '\n' || ch == '\0') {
+			throw InvalidInputException("http_client: the value of header \"%s\" contains a line break or NUL byte",
+			                            name);
+		}
+	}
+}
 
-        GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, LENTRY_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, params_vector, result,
-            [&](STRING_TYPE url, LENTRY_TYPE headers, LENTRY_TYPE params)
-            {
-                std::string url_str = url.val.GetString();
+static void CollectResponseHeaders(const HTTPResponse &response, HeaderList &out) {
+	for (auto &entry : response.headers) {
+		auto values = response.headers.GetHeaderValues(entry.first);
+		string joined;
+		if (values.empty()) {
+			joined = entry.second;
+		} else {
+			joined = StringUtil::Join(values, ", ");
+		}
+		out.emplace_back(StringUtil::Lower(entry.first), joined);
+	}
+}
 
-                // Use helper to setup client and parse URL
-                auto client_and_path = SetupHttpClient(url_str);
-                auto &client = client_and_path.first;
-                auto &path = client_and_path.second;
+static string ResponseTooLargeMessage(const string &url, idx_t max_size) {
+	return StringUtil::Format("http_client: the response from \"%s\" is larger than %s = %llu bytes", url,
+	                          MAX_RESPONSE_SIZE_SETTING, max_size);
+}
 
-                // Prepare headers
-                duckdb_httplib_openssl::Headers header_map;
-                auto header_list = headers.val;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Headers>(header_list, headers_entry, header_map);
+// Sends one request (no redirect handling) through DuckDB's HTTPUtil.
+static unique_ptr<HTTPResponse> SendOnce(ClientContext &context, HttpMethod method, const string &url, bool https,
+                                         const HeaderList &header_list, const string &body,
+                                         const string &content_type, idx_t max_size, string &body_out) {
+	auto &http_util = GetHttpUtil(context, https, method);
+	auto params = http_util.InitializeParameters(context, url);
+	params->follow_location = false;
 
-                // Prepare params
-                duckdb_httplib_openssl::Params param_map;
-                auto params_list = params.val;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Params>(params_list, params_entry, param_map);
+	HTTPHeaders headers;
+	for (auto &h : header_list) {
+		headers.Insert(h.first, h.second);
+	}
+	body_out.clear();
+	unique_ptr<HTTPResponse> response;
+	switch (method) {
+	case HttpMethod::Get: {
+		bool too_large = false;
+		bool interrupted = false;
+		GetRequestInfo request(
+		    url, headers, *params,
+		    [&](const HTTPResponse &resp) {
+			    body_out.clear();
+			    if (too_large || interrupted) {
+				    return false;
+			    }
+			    if (resp.HasHeader("Content-Length")) {
+				    idx_t content_length;
+				    auto header = resp.GetHeaderValue("Content-Length");
+				    if (TryCast::Operation<string_t, idx_t>(string_t(header), content_length, false) &&
+				        content_length > max_size) {
+					    too_large = true;
+					    return false;
+				    }
+			    }
+			    return true;
+		    },
+		    [&](const_data_ptr_t data, idx_t data_length) {
+			    if (context.IsInterrupted()) {
+				    interrupted = true;
+				    return false;
+			    }
+			    if (body_out.size() + data_length > max_size) {
+				    too_large = true;
+				    return false;
+			    }
+			    body_out.append(const_char_ptr_cast(data), data_length);
+			    return true;
+		    });
+		request.try_request = true;
+		response = http_util.Request(request);
+		if (interrupted) {
+			throw InterruptException();
+		}
+		if (too_large) {
+			throw InvalidInputException(ResponseTooLargeMessage(url, max_size));
+		}
+		return response;
+	}
+	case HttpMethod::Head: {
+		HeadRequestInfo request(url, headers, *params);
+		request.try_request = true;
+		response = http_util.Request(request);
+		break;
+	}
+	case HttpMethod::Delete: {
+		DeleteRequestInfo request(url, headers, *params);
+		request.try_request = true;
+		response = http_util.Request(request);
+		break;
+	}
+	case HttpMethod::Put: {
+		PutRequestInfo request(url, headers, *params, const_data_ptr_cast(body.data()), body.size(), content_type);
+		request.try_request = true;
+		response = http_util.Request(request);
+		break;
+	}
+	case HttpMethod::Post:
+	case HttpMethod::PostForm: {
+		if (!headers.HasHeader("Content-Type")) {
+			headers.Insert("Content-Type", content_type);
+		}
+		PostRequestInfo request(url, headers, *params, const_data_ptr_cast(body.data()), body.size());
+		request.try_request = true;
+		response = http_util.Request(request);
+		if (response && !response->HasRequestError()) {
+			body_out = request.buffer_out.empty() ? response->body : request.buffer_out;
+		}
+		break;
+	}
+	}
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	if (response && !response->HasRequestError() && method != HttpMethod::Post &&
+	    method != HttpMethod::PostForm) {
+		body_out = response->body;
+	}
+	if (body_out.size() > max_size) {
+		throw InvalidInputException(ResponseTooLargeMessage(url, max_size));
+	}
+	return response;
+}
 
-                // Make the POST request with headers and params
-                auto res = client.Get(path.c_str(), param_map, header_map);
-                if (res)
-                {
-                    std::string response = GetJsonResponse(res->status, res->reason, res->body);
-                    return StringVector::AddString(result, response);
-                }
-                else
-                {
-                    std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "GET"), "");
-                    return StringVector::AddString(result, response);
-                }
-            });
-    }
+// Performs a request, following redirects by hand so every hop is checked again: https:// is never downgraded to
+// http://, and credentials the caller supplied (Authorization, Cookie, URL userinfo) are dropped when a redirect
+// leaves the original scheme/host/port. HTTP secrets are looked up again for every hop.
+static HttpResult PerformRequest(ClientContext &context, HttpRequestSpec spec) {
+	CheckExternalAccess(context, spec.method);
+	const auto max_size = GetUBigIntSetting(context, MAX_RESPONSE_SIZE_SETTING, DEFAULT_MAX_RESPONSE_SIZE);
+	const auto max_redirects = GetUBigIntSetting(context, MAX_REDIRECTS_SETTING, DEFAULT_MAX_REDIRECTS);
 
-    static void HTTPPostRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 3);
+	for (auto &h : spec.headers) {
+		ValidateHeader(h.first, h.second);
+	}
+	auto parsed = ParseUrl(spec.url);
+	if (parsed.has_userinfo && !HasHeader(spec.headers, "Authorization")) {
+		spec.headers.emplace_back("Authorization",
+		                          "Basic " + Blob::ToBase64(string_t(parsed.userinfo.data(),
+		                                                             NumericCast<uint32_t>(parsed.userinfo.size()))));
+	}
+	string url = parsed.url;
+	bool https = parsed.https;
+	const auto origin = ProtoHostPort(url);
+	auto method = spec.method;
 
-        using STRING_TYPE = PrimitiveType<string_t>;
-        using LENTRY_TYPE = PrimitiveType<list_entry_t>;
+	HttpResult result;
+	for (idx_t hop = 0;; hop++) {
+		CheckExternalAccess(context, method);
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		string body_out;
+		auto response = SendOnce(context, method, url, https, spec.headers, spec.body, spec.default_content_type,
+		                         max_size, body_out);
+		if (!response || response->HasRequestError()) {
+			result.ok = false;
+			result.status = -1;
+			result.reason = StringUtil::Format("HTTP %s request failed. %s", MethodName(method),
+			                                   response ? response->GetRequestError() : string("Unknown error."));
+			return result;
+		}
+		if (IsRedirect(response->status) && response->HasHeader("Location") && max_redirects > 0) {
+			if (hop >= max_redirects) {
+				result.ok = false;
+				result.status = -1;
+				result.reason = StringUtil::Format("HTTP %s request failed. Too many redirects (more than %s = %llu).",
+				                                   MethodName(method), MAX_REDIRECTS_SETTING, max_redirects);
+				return result;
+			}
+			auto next = ParseUrl(ResolveRedirect(url, response->GetHeaderValue("Location")));
+			if (https && !next.https) {
+				throw IOException("http_client: refusing to follow a redirect from https:// to plain http:// (\"%s\" "
+				                  "-> \"%s\")",
+				                  url, next.url);
+			}
+			if (ProtoHostPort(next.url) != origin) {
+				RemoveHeader(spec.headers, "Authorization");
+				RemoveHeader(spec.headers, "Cookie");
+				RemoveHeader(spec.headers, "Proxy-Authorization");
+			}
+			if (next.has_userinfo) {
+				throw IOException("http_client: refusing to follow a redirect to a URL with credentials (\"%s\")",
+				                  next.url);
+			}
+			auto status = response->status;
+			if (method != HttpMethod::Head &&
+			    (status == HTTPStatusCode::SeeOther_303 ||
+			     ((status == HTTPStatusCode::MovedPermanently_301 || status == HTTPStatusCode::Found_302) &&
+			      (method == HttpMethod::Post || method == HttpMethod::PostForm)))) {
+				// As browsers do: the redirected request becomes a GET without a body
+				method = HttpMethod::Get;
+				spec.body.clear();
+				RemoveHeader(spec.headers, "Content-Type");
+			}
+			url = next.url;
+			https = next.https;
+			continue;
+		}
+		result.ok = true;
+		result.status = static_cast<int>(response->status);
+		result.reason = response->reason.empty() ? HTTPUtil::GetStatusMessage(response->status) : response->reason;
+		result.body = std::move(body_out);
+		CollectResponseHeaders(*response, result.headers);
+		return result;
+	}
+}
 
-        auto &url_vector = args.data[0];
-        auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetChild(headers_vector);
-        auto &body_vector = args.data[2];
+//===--------------------------------------------------------------------===//
+// Result JSON
+//===--------------------------------------------------------------------===//
 
-        GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, STRING_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, body_vector, result,
-            [&](STRING_TYPE url, LENTRY_TYPE headers, STRING_TYPE body)
-            {
-                std::string url_str = url.val.GetString();
+static string HeadersToJson(const HeaderList &headers) {
+	string out = "{";
+	for (idx_t i = 0; i < headers.size(); i++) {
+		if (i > 0) {
+			out += ", ";
+		}
+		out += "\"" + EscapeJson(SanitizeUtf8(headers[i].first)) + "\": \"" +
+		       EscapeJson(SanitizeUtf8(headers[i].second)) + "\"";
+	}
+	out += "}";
+	return out;
+}
 
-                // Use helper to setup client and parse URL
-                auto client_and_path = SetupHttpClient(url_str);
-                auto &client = client_and_path.first;
-                auto &path = client_and_path.second;
+static string ResultToJson(const HttpResult &result, bool include_body) {
+	string out = StringUtil::Format("{ \"status\": %d, \"reason\": \"%s\"", result.status,
+	                                EscapeJson(SanitizeUtf8(result.reason)));
+	if (include_body) {
+		if (IsValidUtf8(result.body)) {
+			out += ", \"body\": \"" + EscapeJson(result.body) + "\"";
+		} else {
+			// JSON strings must be UTF-8: binary bodies are returned base64-encoded
+			out += ", \"body\": \"" +
+			       Blob::ToBase64(string_t(result.body.data(), NumericCast<uint32_t>(result.body.size()))) +
+			       "\", \"body_encoding\": \"base64\"";
+		}
+	}
+	out += ", \"headers\": " + HeadersToJson(result.headers) + " }";
+	return out;
+}
 
-                // Prepare headers
-                duckdb_httplib_openssl::Headers header_map;
-                auto header_list = headers.val;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Headers>(header_list, headers_entry, header_map);
+//===--------------------------------------------------------------------===//
+// Scalar functions
+//===--------------------------------------------------------------------===//
 
-                // Make the POST request with headers and body
-                auto res = client.Post(path.c_str(), header_map, body.val.GetString(), "application/json");
-                if (res)
-                {
-                    std::string response = GetJsonResponse(res->status, res->reason, res->body);
-                    return StringVector::AddString(result, response);
-                }
-                else
-                {
-                    std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "POST"), "");
-                    return StringVector::AddString(result, response);
-                }
-            });
-    }
+// Reads a MAP(VARCHAR, VARCHAR) argument; NULL means no entries and NULL values become empty strings.
+static HeaderList MapToList(const Value &value) {
+	HeaderList result;
+	if (value.IsNull()) {
+		return result;
+	}
+	for (auto &entry : MapValue::GetChildren(value)) {
+		auto &kv = StructValue::GetChildren(entry);
+		if (kv.size() != 2 || kv[0].IsNull()) {
+			continue;
+		}
+		result.emplace_back(kv[0].ToString(), kv[1].IsNull() ? string() : kv[1].ToString());
+	}
+	return result;
+}
 
-    static void HTTPPostFormRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() == 3);
+static string EncodeForm(const HeaderList &params) {
+	string out;
+	for (auto &p : params) {
+		if (!out.empty()) {
+			out += '&';
+		}
+		out += PercentEncode(p.first) + "=" + PercentEncode(p.second);
+	}
+	return out;
+}
 
-        using STRING_TYPE = PrimitiveType<string_t>;
-        using LENTRY_TYPE = PrimitiveType<list_entry_t>;
+static string AppendQuery(const string &url, const HeaderList &params) {
+	if (params.empty()) {
+		return url;
+	}
+	auto fragment = url.find('#');
+	auto base = url.substr(0, fragment);
+	auto tail = fragment == string::npos ? string() : url.substr(fragment);
+	string sep;
+	auto q = base.find('?');
+	if (q == string::npos) {
+		sep = "?";
+	} else if (q != base.size() - 1 && base.back() != '&') {
+		sep = "&";
+	}
+	return base + sep + EncodeForm(params) + tail;
+}
 
-        auto &url_vector = args.data[0];
-        auto &headers_vector = args.data[1];
-        auto &headers_entry = ListVector::GetChild(headers_vector);
-        auto &body_vector = args.data[2];
-        auto &body_entry = ListVector::GetChild(body_vector);
+template <HttpMethod METHOD>
+static void HttpRequestFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	const auto count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 
-        GenericExecutor::ExecuteTernary<STRING_TYPE, LENTRY_TYPE, LENTRY_TYPE, STRING_TYPE>(
-            url_vector, headers_vector, body_vector, result,
-            [&](STRING_TYPE url, LENTRY_TYPE headers, LENTRY_TYPE params)
-            {
-                std::string url_str = url.val.GetString();
+	for (idx_t row = 0; row < count; row++) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto url_value = args.data[0].GetValue(row);
+		if (url_value.IsNull()) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		HttpRequestSpec spec;
+		spec.method = METHOD;
+		spec.url = url_value.ToString();
+		spec.headers = MapToList(args.data[1].GetValue(row));
 
-                // Use helper to setup client and parse URL
-                auto client_and_path = SetupHttpClient(url_str);
-                auto &client = client_and_path.first;
-                auto &path = client_and_path.second;
+		switch (METHOD) {
+		case HttpMethod::Get:
+			spec.url = AppendQuery(spec.url, MapToList(args.data[2].GetValue(row)));
+			break;
+		case HttpMethod::Post:
+		case HttpMethod::Put: {
+			auto body = args.data[2].GetValue(row);
+			if (METHOD == HttpMethod::Post) {
+				// `params` is the name earlier versions gave the body; it is still accepted
+				auto legacy = args.data[3].GetValue(row);
+				if (!legacy.IsNull()) {
+					if (!body.IsNull()) {
+						throw InvalidInputException("http_post: pass the request body as either body or params, "
+						                            "not both");
+					}
+					body = legacy;
+				}
+			}
+			spec.body = body.IsNull() ? string() : body.ToString();
+			spec.default_content_type = "application/json";
+			break;
+		}
+		case HttpMethod::PostForm:
+			spec.body = EncodeForm(MapToList(args.data[2].GetValue(row)));
+			spec.default_content_type = "application/x-www-form-urlencoded";
+			break;
+		default:
+			break;
+		}
+		auto response = PerformRequest(context, std::move(spec));
+		result_data[row] = StringVector::AddString(result, ResultToJson(response, METHOD != HttpMethod::Head));
+	}
+}
 
-                // Prepare headers and parameters
-                duckdb_httplib_openssl::Headers header_map;
-                duckdb_httplib_openssl::Params params_map;
-                ConvertListEntryToMap<duckdb_httplib_openssl::Headers>(headers.val, headers_entry, header_map);
-                ConvertListEntryToMap<duckdb_httplib_openssl::Params>(params.val, body_entry, params_map);
+//===--------------------------------------------------------------------===//
+// Registration
+//===--------------------------------------------------------------------===//
 
-                // Make the POST request with headers and params
-                auto res = client.Post(path.c_str(), header_map, params_map);
-                if (res)
-                {
-                    std::string response = GetJsonResponse(res->status, res->reason, res->body);
-                    return StringVector::AddString(result, response);
-                }
-                else
-                {
-                    std::string response = GetJsonResponse(-1, GetHttpErrorMessage(res, "POST"), "");
-                    return StringVector::AddString(result, response);
-                }
-            });
-    }
+struct HttpParam {
+	const char *name;
+	LogicalType type;
+	bool optional;
+};
 
-    // Every function here performs a network request — a side effect. Such
-    // functions MUST be VOLATILE, otherwise DuckDB's optimizer treats them as
-    // pure and may evaluate a call with all-constant arguments at plan time
-    // (constant folding) in addition to execution time. Concretely, nesting a
-    // call inside a larger constant expression — the common idiom
-    //   SELECT http_post('http://…', …)->>'access_token'
-    // — sends the request TWICE on one query. The query result is still a
-    // single correct row, so the duplicate is only visible in the server's
-    // logs; for non-idempotent endpoints (OAuth code exchange, webhooks,
-    // POSTs that create rows) it is a correctness bug. Marking the functions
-    // volatile (same class as random()/nextval()) pins one request per
-    // logical call. Verified: nested constant-arg http_post sends 2 without
-    // volatile, exactly 1 with it; column/bind arguments already sent once
-    // and are unaffected.
-    static ScalarFunction MakeVolatile(ScalarFunction fn)
-    {
-        fn.SetVolatile();
-        // Network failures are reported in the JSON result, but building the
-        // request (e.g. reading MAP arguments) can still raise; DuckDB 2.0
-        // requires such functions to be marked fallible.
-        fn.SetFallible();
-        return fn;
-    }
+static void RegisterHttpFunction(ExtensionLoader &loader, const string &name, const vector<HttpParam> &parameters,
+                                 scalar_function_t function, const string &description, vector<string> examples) {
+	FunctionSignature signature;
+	for (auto &param : parameters) {
+		if (param.optional) {
+			// NULL by default: the parameter can be left out or passed by name
+			signature.AddParameter(param.name, param.type, Value(param.type));
+		} else {
+			signature.AddParameter(param.name, param.type);
+		}
+	}
+	signature.SetReturnType(LogicalType::JSON());
+	ScalarFunction fn(Identifier(name), std::move(signature), std::move(function));
+	// Every call performs a network request - a side effect. VOLATILE keeps the optimizer from constant-folding
+	// a call with constant arguments, which would send the request twice (once at plan time).
+	fn.SetVolatile();
+	// URL validation, header validation, the external-access check and size limits raise errors.
+	fn.SetFallible();
+	// NULL headers/params/body mean "none"; only a NULL url gives a NULL result.
+	fn.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 
-    static void LoadInternal(ExtensionLoader &loader)
-    {
-        // Parameters are named so callers can keep using `headers => ...` / `params => ...` (DuckDB 2.0 only
-        // matches named arguments of scalar functions against declared parameter names).
-        const auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	CreateScalarFunctionInfo info(std::move(fn));
+	FunctionDescription desc;
+	desc.description = description;
+	desc.examples = std::move(examples);
+	desc.categories = {"http", "network"};
+	info.descriptions.push_back(std::move(desc));
+	loader.RegisterFunction(std::move(info));
+}
 
-        ScalarFunctionSet http_head("http_head");
-        http_head.AddFunction(MakeVolatile(ScalarFunction({FunctionParameter("url", LogicalType::VARCHAR)}, LogicalType::JSON(), HTTPHeadRequestFunction)));
-        loader.RegisterFunction(http_head);
+static void LoadInternal(ExtensionLoader &loader) {
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption(MAX_RESPONSE_SIZE_SETTING,
+	                          "Largest HTTP response body, in bytes, that the http_client functions will accept",
+	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_MAX_RESPONSE_SIZE));
+	config.AddExtensionOption(MAX_REDIRECTS_SETTING,
+	                          "How many redirects the http_client functions follow (0 returns the 3xx response)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_MAX_REDIRECTS));
 
-        ScalarFunctionSet http_get("http_get");
-        http_get.AddFunction(MakeVolatile(ScalarFunction({FunctionParameter("url", LogicalType::VARCHAR)}, LogicalType::JSON(), HTTPGetRequestFunction)));
-        http_get.AddFunction(MakeVolatile(ScalarFunction(
-            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
-             FunctionParameter("params", map_type)},
-            LogicalType::JSON(), HTTPGetExRequestFunction)));
-        loader.RegisterFunction(http_get);
+	const auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	const auto json_type = LogicalType::JSON();
+	const HttpParam url {"url", LogicalType::VARCHAR, false};
+	const HttpParam headers {"headers", map_type, true};
+	const HttpParam map_params {"params", map_type, true};
+	const HttpParam body {"body", json_type, true};
 
-        ScalarFunctionSet http_post("http_post");
-        http_post.AddFunction(MakeVolatile(ScalarFunction(
-            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
-             FunctionParameter("params", LogicalType::JSON())},
-            LogicalType::JSON(), HTTPPostRequestFunction)));
-        loader.RegisterFunction(http_post);
+	const string common = " Returns JSON {status, reason, body, headers}; status is -1 and reason describes the "
+	                      "error when no response was received. Uses DuckDB's HTTP stack (http_timeout, http_retries, "
+	                      "http_proxy and HTTP secrets apply); refuses when enable_external_access is false.";
 
-        ScalarFunctionSet http_post_form("http_post_form");
-        http_post_form.AddFunction(MakeVolatile(ScalarFunction(
-            {FunctionParameter("url", LogicalType::VARCHAR), FunctionParameter("headers", map_type),
-             FunctionParameter("params", map_type)},
-            LogicalType::JSON(), HTTPPostFormRequestFunction)));
-        loader.RegisterFunction(http_post_form);
+	RegisterHttpFunction(loader, "http_head", {url, headers}, HttpRequestFunction<HttpMethod::Head>,
+	                     "Sends an HTTP HEAD request. Returns JSON {status, reason, headers} with the response headers "
+	                     "as a JSON object (lower-case names). Refuses when enable_external_access is false.",
+	                     {"http_head('https://example.com')"});
+	RegisterHttpFunction(loader, "http_get", {url, headers, map_params}, HttpRequestFunction<HttpMethod::Get>,
+	                     "Sends an HTTP GET request; params are URL-encoded and appended to the query string." +
+	                         common,
+	                     {"http_get('https://httpbin.org/get')",
+	                      "http_get('https://httpbin.org/get', headers => MAP {'Accept': 'application/json'}, params "
+	                      "=> MAP {'limit': '10'})"});
+	RegisterHttpFunction(loader, "http_post", {url, headers, body, HttpParam {"params", json_type, true}},
+	                     HttpRequestFunction<HttpMethod::Post>,
+	                     "Sends an HTTP POST request with a JSON body (Content-Type application/json unless a header "
+	                     "overrides it). params is a deprecated alias for body." +
+	                         common,
+	                     {"http_post('https://httpbin.org/post', headers => MAP {'Accept': 'application/json'}, body "
+	                      "=> {'name': 'duck'})"});
+	RegisterHttpFunction(loader, "http_post_form", {url, headers, map_params},
+	                     HttpRequestFunction<HttpMethod::PostForm>,
+	                     "Sends an HTTP POST request with an application/x-www-form-urlencoded body built from "
+	                     "params." +
+	                         common,
+	                     {"http_post_form('https://httpbin.org/post', params => MAP {'limit': '10'})"});
+	RegisterHttpFunction(loader, "http_put", {url, headers, body}, HttpRequestFunction<HttpMethod::Put>,
+	                     "Sends an HTTP PUT request with a JSON body (Content-Type application/json unless a header "
+	                     "overrides it)." +
+	                         common,
+	                     {"http_put('https://httpbin.org/put', body => {'name': 'duck'})"});
+	RegisterHttpFunction(loader, "http_delete", {url, headers}, HttpRequestFunction<HttpMethod::Delete>,
+	                     "Sends an HTTP DELETE request." + common, {"http_delete('https://httpbin.org/delete')"});
 
-        QueryFarmSendTelemetry(loader, "http_client", "2026102002");
-    }
+	QueryFarmSendTelemetry(loader, "http_client", HTTP_CLIENT_VERSION);
+}
 
-    void HttpClientExtension::Load(ExtensionLoader &loader)
-    {
-        LoadInternal(loader);
-    }
+void HttpClientExtension::Load(ExtensionLoader &loader) {
+	LoadInternal(loader);
+}
 
-    std::string HttpClientExtension::Name()
-    {
-        return "http_client";
-    }
+std::string HttpClientExtension::Name() {
+	return "http_client";
+}
 
-    std::string HttpClientExtension::Version() const
-    {
-        return "2026102002";
-    }
+std::string HttpClientExtension::Version() const {
+	return HTTP_CLIENT_VERSION;
+}
 
 } // namespace duckdb
 
-extern "C"
-{
-    DUCKDB_CPP_EXTENSION_ENTRY(http_client, loader)
-    {
-        duckdb::LoadInternal(loader);
-    }
+extern "C" {
+DUCKDB_CPP_EXTENSION_ENTRY(http_client, loader) {
+	duckdb::LoadInternal(loader);
+}
 }

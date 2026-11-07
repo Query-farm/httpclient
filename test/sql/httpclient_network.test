@@ -1,0 +1,40 @@
+# name: test/sql/httpclient_network.test
+# description: live requests to public HTTPS services (only with HTTP_CLIENT_NETWORK_TESTS set)
+# group: [http_client]
+
+require-env HTTP_CLIENT_NETWORK_TESTS
+
+require http_client
+
+require httpfs
+
+require json
+
+query II
+SELECT (r->>'status')::INT, ((r->>'body')::JSON)->'headers'->>'Host'
+FROM (SELECT http_get('https://httpbin.org/get', headers => MAP {'accept': 'application/json'}, params => MAP {'limit': 10}) AS r);
+----
+200	httpbin.org
+
+query II
+SELECT (r->>'status')::INT, ((r->>'body')::JSON)->'json'->>'name'
+FROM (SELECT http_post('https://httpbin.org/post', headers => MAP {'accept': 'application/json'}, body => {'name': 'duck'}) AS r);
+----
+200	duck
+
+query II
+SELECT (r->>'status')::INT, ((r->>'body')::JSON)->'form'->>'limit'
+FROM (SELECT http_post_form('https://httpbin.org/post', params => MAP {'limit': 10}) AS r);
+----
+200	10
+
+query I
+SELECT (http_head('https://httpbin.org/get')->>'status')::INT;
+----
+200
+
+# https:// is never redirected to plain http://
+statement error
+SELECT http_get('https://httpbin.org/redirect-to?url=http%3A%2F%2Fexample.com%2F');
+----
+refusing to follow a redirect from https:// to plain http://

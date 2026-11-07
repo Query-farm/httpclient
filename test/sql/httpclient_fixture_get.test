@@ -1,0 +1,177 @@
+# name: test/sql/httpclient_fixture_get.test
+# description: GET behaviour against the local fixture server (python3 test/fixture_server.py; needs httpfs)
+# group: [http_client]
+
+require-env HTTP_CLIENT_FIXTURE_URL
+
+# Path to an httpfs.duckdb_extension built for this DuckDB (DuckDB's built-in client only does plain GET)
+require-env HTTP_CLIENT_HTTPFS
+
+require http_client
+
+require json
+
+statement ok
+LOAD '{HTTP_CLIENT_HTTPFS}';
+
+statement ok
+SET http_retries = 0;
+
+# Basic GET; the response headers are returned as a JSON object with lower-case names
+query III
+SELECT (r->>'status')::INT, r->>'reason', ((r->>'body')::JSON)->>'method'
+FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/echo') AS r);
+----
+200	OK	GET
+
+query I
+SELECT r->'headers'->>'content-type' FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/echo') AS r);
+----
+application/json
+
+# Request headers are sent; params are URL-encoded and appended, also to an existing query string
+query III
+SELECT b->'headers'->>'x-test', b->>'raw_query', b->'query'->>'q'
+FROM (SELECT (http_get('{HTTP_CLIENT_FIXTURE_URL}/echo?a=1#frag', headers => MAP {'X-Test': 'yes'},
+                       params => MAP {'q': 'x y&z', 'ü': '1'})->>'body')::JSON AS b);
+----
+yes	a=1&q=x%20y%26z&%C3%BC=1	x y&z
+
+# Userinfo in the URL becomes basic auth and is not sent in the URL
+query I
+SELECT b->'headers'->>'authorization'
+FROM (SELECT (http_get('http://us%40er:p%3Ass@' || replace('{HTTP_CLIENT_FIXTURE_URL}', 'http://', '') || '/echo')->>'body')::JSON AS b);
+----
+Basic dXNAZXI6cDpzcw==
+
+# Error statuses are returned, not raised
+query II
+SELECT (r->>'status')::INT, r->>'body' FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/status/404') AS r);
+----
+404	(empty)
+
+query I
+SELECT (http_get('{HTTP_CLIENT_FIXTURE_URL}/status/500')->>'status')::INT;
+----
+500
+
+# Unicode bodies come back as text; bodies that are not UTF-8 come back base64-encoded
+query II
+SELECT r->>'body', r->>'body_encoding' FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/unicode') AS r);
+----
+héllo wörld 🦆 "q"	NULL
+
+query II
+SELECT r->>'body', r->>'body_encoding' FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/binary') AS r);
+----
+//4AAQ==	base64
+
+query I
+SELECT json_valid(http_get('{HTTP_CLIENT_FIXTURE_URL}/binary'));
+----
+true
+
+# Repeated and quoted response headers
+query II
+SELECT r->'headers'->>'x-repeat', r->'headers'->>'x-quoted' FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/multi') AS r);
+----
+a, b	say "hi"\
+
+# Redirects are followed, relative and absolute
+query II
+SELECT (r->>'status')::INT, ((r->>'body')::JSON)->>'path'
+FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/echo') AS r);
+----
+200	/echo
+
+query I
+SELECT ((http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to={HTTP_CLIENT_FIXTURE_URL}/echo%3Fx%3D1')->>'body')::JSON)->>'raw_query';
+----
+x=1
+
+# ... but every hop is checked again
+statement error
+SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=file:///etc/passwd');
+----
+only http:// and https:// URLs are supported
+
+# Credentials are dropped when a redirect changes host (127.0.0.1 -> localhost)
+query II
+SELECT b->'headers'->>'authorization', b->'headers'->>'x-other'
+FROM (SELECT (http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=' || replace('{HTTP_CLIENT_FIXTURE_URL}', '127.0.0.1', 'localhost') || '/echo',
+                       headers => MAP {'Authorization': 'Bearer secret', 'X-Other': 'kept'})->>'body')::JSON AS b);
+----
+NULL	kept
+
+# ... and kept on the same host
+query I
+SELECT ((http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/echo', headers => MAP {'Authorization': 'Bearer secret'})->>'body')::JSON)->'headers'->>'authorization';
+----
+Bearer secret
+
+# Chains of redirects are followed
+query II
+SELECT (r->>'status')::INT, r->>'reason' LIKE '%Too many redirects%'
+FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/redirect%3Fto%3D/redirect%253Fto%253D/echo') AS r);
+----
+200	false
+
+statement ok
+SET http_client_max_redirects = 1;
+
+query II
+SELECT (r->>'status')::INT, r->>'reason' LIKE '%Too many redirects%'
+FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/redirect%3Fto%3D/echo') AS r);
+----
+-1	true
+
+# With redirects off, the 3xx response itself is returned
+statement ok
+SET http_client_max_redirects = 0;
+
+query II
+SELECT (r->>'status')::INT, r->'headers'->>'location' FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/echo') AS r);
+----
+302	/echo
+
+statement ok
+RESET http_client_max_redirects;
+
+# Response size limit
+statement ok
+SET http_client_max_response_size = 1000;
+
+query I
+SELECT length(http_get('{HTTP_CLIENT_FIXTURE_URL}/big?bytes=1000')->>'body');
+----
+1000
+
+statement error
+SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/big?bytes=1001');
+----
+is larger than http_client_max_response_size = 1000 bytes
+
+statement ok
+RESET http_client_max_response_size;
+
+# Timeouts come from DuckDB's http_timeout setting
+statement ok
+SET http_timeout = 1;
+
+query II
+SELECT (r->>'status')::INT, r->>'reason' LIKE 'HTTP GET request failed.%'
+FROM (SELECT http_get('{HTTP_CLIENT_FIXTURE_URL}/slow?seconds=3') AS r);
+----
+-1	true
+
+statement ok
+RESET http_timeout;
+
+# Column input: one request per row
+query II
+SELECT p, ((http_get('{HTTP_CLIENT_FIXTURE_URL}/echo', params => MAP {'p': p})->>'body')::JSON)->'query'->>'p'
+FROM (VALUES ('a'), ('b'), ('c')) t(p) ORDER BY p;
+----
+a	a
+b	b
+c	c

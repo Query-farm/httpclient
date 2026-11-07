@@ -1,0 +1,57 @@
+# name: test/sql/httpclient_external_access.test
+# description: the http_client functions refuse to send requests when enable_external_access is false
+# group: [http_client]
+
+require http_client
+
+require json
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+SELECT http_get('http://127.0.0.1:1/');
+----
+enable_external_access is false
+
+statement error
+SELECT http_get('https://example.com/', headers => MAP {'Accept': 'text/plain'}, params => MAP {'a': 'b'});
+----
+enable_external_access is false
+
+statement error
+SELECT http_head('https://example.com/');
+----
+enable_external_access is false
+
+statement error
+SELECT http_post('https://example.com/', body => {'a': 1});
+----
+enable_external_access is false
+
+statement error
+SELECT http_post_form('https://example.com/', params => MAP {'a': 'b'});
+----
+enable_external_access is false
+
+statement error
+SELECT http_put('https://example.com/', body => {'a': 1});
+----
+enable_external_access is false
+
+statement error
+SELECT http_delete('https://example.com/');
+----
+enable_external_access is false
+
+# Column input is refused too
+statement error
+SELECT http_get(u) FROM (VALUES ('http://127.0.0.1:1/a'), ('http://127.0.0.1:1/b')) t(u);
+----
+enable_external_access is false
+
+# NULL still returns NULL
+query I
+SELECT http_get(NULL::VARCHAR) IS NULL;
+----
+true

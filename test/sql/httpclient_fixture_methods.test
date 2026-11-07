@@ -1,0 +1,135 @@
+# name: test/sql/httpclient_fixture_methods.test
+# description: HEAD/POST/PUT/DELETE against the local fixture server (needs httpfs)
+# group: [http_client]
+
+require-env HTTP_CLIENT_FIXTURE_URL
+
+# Path to an httpfs.duckdb_extension built for this DuckDB (DuckDB's built-in client only does plain GET)
+require-env HTTP_CLIENT_HTTPFS
+
+require http_client
+
+require json
+
+statement ok
+LOAD '{HTTP_CLIENT_HTTPFS}';
+
+statement ok
+SET http_retries = 0;
+
+# http_head returns the headers as a JSON object (no longer a JSON string inside JSON)
+query III
+SELECT (r->>'status')::INT, json_type(r->'headers'), r->'headers'->>'content-type'
+FROM (SELECT http_head('{HTTP_CLIENT_FIXTURE_URL}/echo') AS r);
+----
+200	OBJECT	application/json
+
+query I
+SELECT http_head('{HTTP_CLIENT_FIXTURE_URL}/echo')->>'body';
+----
+NULL
+
+# POST with a JSON body, positional and named (body => and the deprecated params =>)
+query III
+SELECT b->>'method', b->>'body', b->'headers'->>'content-type'
+FROM (SELECT (http_post('{HTTP_CLIENT_FIXTURE_URL}/echo', MAP {'Accept': 'application/json'}, {'name': 'duck', 'n': 1})->>'body')::JSON AS b);
+----
+POST	{"name":"duck","n":1}	application/json
+
+query I
+SELECT ((http_post('{HTTP_CLIENT_FIXTURE_URL}/echo', body => '[1,2]')->>'body')::JSON)->>'body';
+----
+[1,2]
+
+query I
+SELECT ((http_post('{HTTP_CLIENT_FIXTURE_URL}/echo', headers => MAP {}, params => {'old': true})->>'body')::JSON)->>'body';
+----
+{"old":true}
+
+# A Content-Type header overrides the default
+query I
+SELECT ((http_post('{HTTP_CLIENT_FIXTURE_URL}/echo', headers => MAP {'Content-Type': 'application/vnd.test+json'}, body => '{}')->>'body')::JSON)->'headers'->>'content-type';
+----
+application/vnd.test+json
+
+# No body: an empty POST
+query I
+SELECT ((http_post('{HTTP_CLIENT_FIXTURE_URL}/echo')->>'body')::JSON)->>'body';
+----
+(empty)
+
+# Form POST
+query III
+SELECT b->>'method', b->>'body', b->'headers'->>'content-type'
+FROM (SELECT (http_post_form('{HTTP_CLIENT_FIXTURE_URL}/echo', params => MAP {'limit': '10', 'q': 'a b&c'})->>'body')::JSON AS b);
+----
+POST	limit=10&q=a%20b%26c	application/x-www-form-urlencoded
+
+# PUT and DELETE
+query II
+SELECT b->>'method', b->>'body'
+FROM (SELECT (http_put('{HTTP_CLIENT_FIXTURE_URL}/echo', body => {'x': [1, 2]})->>'body')::JSON AS b);
+----
+PUT	{"x":[1,2]}
+
+query II
+SELECT (r->>'status')::INT, ((r->>'body')::JSON)->>'method'
+FROM (SELECT http_delete('{HTTP_CLIENT_FIXTURE_URL}/echo', headers => MAP {'X-Test': '1'}) AS r);
+----
+200	DELETE
+
+# Error statuses are returned for every method
+query IIII
+SELECT (http_head('{HTTP_CLIENT_FIXTURE_URL}/status/404')->>'status')::INT,
+       (http_post('{HTTP_CLIENT_FIXTURE_URL}/status/500', body => '{}')->>'status')::INT,
+       (http_put('{HTTP_CLIENT_FIXTURE_URL}/status/409', body => '{}')->>'status')::INT,
+       (http_delete('{HTTP_CLIENT_FIXTURE_URL}/status/204')->>'status')::INT;
+----
+404	500	409	204
+
+# 303 (and 301/302 after a POST) turns into a GET without a body; 307/308 keep the method and body
+query II
+SELECT b->>'method', b->>'body'
+FROM (SELECT (http_post('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/echo&code=303', body => '{"a":1}')->>'body')::JSON AS b);
+----
+GET	(empty)
+
+query II
+SELECT b->>'method', b->>'body'
+FROM (SELECT (http_post('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/echo&code=307', body => '{"a":1}')->>'body')::JSON AS b);
+----
+POST	{"a":1}
+
+query II
+SELECT b->>'method', b->>'body'
+FROM (SELECT (http_put('{HTTP_CLIENT_FIXTURE_URL}/redirect?to=/echo&code=308', body => '{"a":1}')->>'body')::JSON AS b);
+----
+PUT	{"a":1}
+
+# Response size limit applies to buffered methods too
+statement ok
+SET http_client_max_response_size = 10;
+
+statement error
+SELECT http_post('{HTTP_CLIENT_FIXTURE_URL}/big?bytes=11', body => '{}');
+----
+is larger than http_client_max_response_size = 10 bytes
+
+statement ok
+RESET http_client_max_response_size;
+
+# HTTP secrets apply (bearer token scoped to the fixture server)
+statement ok
+CREATE SECRET fixture_token (TYPE http, BEARER_TOKEN 'tok123', SCOPE '{HTTP_CLIENT_FIXTURE_URL}');
+
+query I
+SELECT ((http_post('{HTTP_CLIENT_FIXTURE_URL}/echo', body => '{}')->>'body')::JSON)->'headers'->>'authorization';
+----
+Bearer tok123
+
+# Connection errors for non-GET methods
+query II
+SELECT (r->>'status')::INT, r->>'reason' LIKE 'HTTP POST request failed.%'
+FROM (SELECT http_post('http://127.0.0.1:1/', body => '{}') AS r);
+----
+-1	true
